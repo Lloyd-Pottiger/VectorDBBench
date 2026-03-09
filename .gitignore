@@ -4,6 +4,7 @@ dist/
 __pycache__
 .env
 .data/
+dataset/
 __MACOSX
 .DS_Store
 build/

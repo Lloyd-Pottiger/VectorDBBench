@@ -1,7 +1,6 @@
 import concurrent.futures
 import io
 import logging
-import time
 from contextlib import contextmanager
 from typing import Any
 
@@ -66,14 +65,12 @@ class TiDB(VectorDB):
 
     def _create_table(self):
         try:
-            index_param = self.case_config.index_param()
             with self._get_connection() as (conn, cursor):
                 cursor.execute(
                     f"""
                     CREATE TABLE {self.table_name} (
                         id BIGINT PRIMARY KEY,
-                        embedding VECTOR({self.dim}) NOT NULL,
-                        VECTOR INDEX (({index_param["metric_fn"]}(embedding)))
+                        embedding VECTOR({self.dim}) NOT NULL
                     );
                     """
                 )
@@ -86,87 +83,26 @@ class TiDB(VectorDB):
         pass
 
     def optimize(self, data_size: int | None = None) -> None:
-        while True:
-            progress = self._optimize_check_tiflash_replica_progress()
-            if progress != 1:
-                log.info("Data replication not ready, progress: %d", progress)
-                time.sleep(2)
-            else:
-                break
+        if self.cursor is None or self.conn is None:
+            raise RuntimeError("TiDB.optimize() must be called within `with self.init():`")
 
-        log.info("Waiting TiFlash to catch up...")
-        self._optimize_wait_tiflash_catch_up()
+        # SPFRESH vector index is currently read-only: build the index only after all data is loaded.
+        # TiDB blocks on this DDL until the index creation completes, so we do not need to poll TiFlash system tables.
+        index_param = self.case_config.index_param()
+        metric_fn = index_param["metric_fn"]
+        metric_suffix = (
+            self.case_config.metric_type.value.lower() if getattr(self.case_config, "metric_type", None) else "unknown"
+        )
+        index_name = f"idx_vec_{metric_suffix}"
 
-        log.info("Start compacting TiFlash replica...")
-        self._optimize_compact_tiflash()
-
-        log.info("Waiting index build to finish...")
-        log_reduce_seq = 0
-        while True:
-            pending_rows = self._optimize_get_tiflash_index_pending_rows()
-            if pending_rows > 0:
-                if log_reduce_seq % 15 == 0:
-                    log.info("Index not fully built, pending rows: %d", pending_rows)
-                log_reduce_seq += 1
-                time.sleep(2)
-            else:
-                break
-
-        log.info("Index build finished successfully.")
-
-    def _optimize_check_tiflash_replica_progress(self):
-        try:
-            database = self.db_config["database"]
-            with self._get_connection() as (_, cursor):
-                cursor.execute(
-                    f"""
-                    SELECT PROGRESS FROM information_schema.tiflash_replica
-                    WHERE TABLE_SCHEMA = "{database}" AND TABLE_NAME = "{self.table_name}"
-                    """  # noqa: S608
-                )
-                result = cursor.fetchone()
-                return result[0]
-        except Exception as e:
-            log.warning("Failed to check TiFlash replica progress: %s", e)
-            raise
-
-    def _optimize_wait_tiflash_catch_up(self):
-        try:
-            with self._get_connection() as (conn, cursor):
-                cursor.execute('SET @@TIDB_ISOLATION_READ_ENGINES="tidb,tiflash"')
-                conn.commit()
-                cursor.execute(f"SELECT COUNT(*) FROM {self.table_name}")  # noqa: S608
-                result = cursor.fetchone()
-                return result[0]
-        except Exception as e:
-            log.warning("Failed to wait TiFlash to catch up: %s", e)
-            raise
-
-    def _optimize_compact_tiflash(self):
-        try:
-            with self._get_connection() as (conn, cursor):
-                cursor.execute(f"ALTER TABLE {self.table_name} COMPACT")
-                conn.commit()
-        except Exception as e:
-            log.warning("Failed to compact table: %s", e)
-            raise
-
-    def _optimize_get_tiflash_index_pending_rows(self):
-        try:
-            database = self.db_config["database"]
-            with self._get_connection() as (_, cursor):
-                cursor.execute(
-                    f"""
-                    SELECT SUM(ROWS_STABLE_NOT_INDEXED)
-                    FROM information_schema.tiflash_indexes
-                    WHERE TIDB_DATABASE = "{database}" AND TIDB_TABLE = "{self.table_name}"
-                    """  # noqa: S608
-                )
-                result = cursor.fetchone()
-                return result[0]
-        except Exception as e:
-            log.warning("Failed to read TiFlash index pending rows: %s", e)
-            raise
+        sql = (
+            f"ALTER TABLE {self.table_name} "
+            f"ADD VECTOR INDEX {index_name} (({metric_fn}(embedding))) USING SPFRESH"
+        )
+        log.info("Start building SPFRESH vector index with DDL: %s", sql)
+        self.cursor.execute(sql)  # noqa: S608
+        self.conn.commit()
+        log.info("SPFRESH vector index build finished successfully.")
 
     def _insert_embeddings_serial(
         self,
@@ -223,11 +159,10 @@ class TiDB(VectorDB):
         timeout: int | None = None,
         **kwargs: Any,
     ) -> list[int]:
-        self.cursor.execute(
-            f"""
+        sql = f"""
             SELECT id FROM {self.table_name}
             ORDER BY {self.search_fn}(embedding, "{query!s}") LIMIT {k};
             """  # noqa: S608
-        )
+        self.cursor.execute(sql)
         result = self.cursor.fetchall()
         return [int(i[0]) for i in result]

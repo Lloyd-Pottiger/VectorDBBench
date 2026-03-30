@@ -1,5 +1,8 @@
-import pytest
 import logging
+import json
+
+import pytest
+
 from vectordb_bench.models import (
     TaskConfig, CaseConfig,
     CaseResult, TestResult,
@@ -7,7 +10,7 @@ from vectordb_bench.models import (
 )
 from vectordb_bench.backend.clients import (
     DB,
-    IndexType
+    IndexType,
 )
 
 from vectordb_bench import config
@@ -68,3 +71,28 @@ class TestModels:
             log.info(json_file)
             res = TestResult.read_file(json_file)
             res.display()
+
+    def test_test_result_read_file_accepts_empty_common_db_metadata(self, tmp_path):
+        result = CaseResult(
+            task_config=TaskConfig(
+                db=DB.TiDB,
+                db_config=DB.TiDB.config_cls(password="", host="127.0.0.1", port=4000, db_name="test"),
+                db_case_config=DB.TiDB.case_config_cls()(),
+                case_config=CaseConfig(case_id=CaseType.Performance1024D1M),
+            ),
+            metrics=Metric(),
+        )
+        test_result = TestResult(run_id="compat-run", task_label="compat", results=[result])
+
+        json_file = tmp_path / "result_compat_tidb.json"
+        json_file.write_text(test_result.json(), encoding="utf-8")
+
+        raw_result = json.loads(json_file.read_text(encoding="utf-8"))
+        raw_db_config = raw_result["results"][0]["task_config"]["db_config"]
+        assert raw_db_config["version"] == ""
+        assert raw_db_config["note"] == ""
+
+        loaded = TestResult.read_file(json_file)
+
+        assert loaded.results[0].task_config.db_config.version == ""
+        assert loaded.results[0].task_config.db_config.note == ""

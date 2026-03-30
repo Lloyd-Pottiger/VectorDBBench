@@ -309,6 +309,15 @@ class TestResult(BaseModel):
             case_config["custom_case"] = custom_case
         return case_config
 
+    @staticmethod
+    def _normalize_db_config(db: DB, db_config: dict) -> dict:
+        normalized_config = dict(db_config)
+        optional_fields = set(db.config_cls.common_short_configs() + db.config_cls.common_long_configs())
+        for field_name in optional_fields:
+            if normalized_config.get(field_name) == "":
+                normalized_config.pop(field_name)
+        return normalized_config
+
     @classmethod
     def read_file(cls, full_path: pathlib.Path, trans_unit: bool = False) -> Self:
         if not full_path.exists():
@@ -324,7 +333,9 @@ class TestResult(BaseModel):
                 case_config = task_config.get("case_config")
                 db = DB(task_config.get("db"))
 
-                task_config["db_config"] = db.config_cls(**task_config["db_config"])
+                task_config["db_config"] = db.config_cls(
+                    **cls._normalize_db_config(db=db, db_config=task_config["db_config"])
+                )
 
                 # Safely instantiate DBCaseConfig (fallback to EmptyDBCaseConfig on None)
                 raw_case_cfg = task_config.get("db_case_config") or {}

@@ -50,7 +50,7 @@ class SerialInsertRunner:
                 msg = f"Insert failed and retried more than {config.MAX_INSERT_RETRY} times"
                 raise RuntimeError(msg) from None
 
-    def task(self) -> int:
+    def task(self) -> tuple[int, dict | None]:
         count = 0
         with self.db.init():
             log.info(f"({mp.current_process().name:16}) Start inserting embeddings in batch {config.NUM_PER_BATCH}")
@@ -96,7 +96,9 @@ class SerialInsertRunner:
                 f"({mp.current_process().name:16}) Finish loading all dataset into VectorDB, "
                 f"dur={time.perf_counter() - start}"
             )
-            return count
+            if hasattr(self.db, "export_load_state"):
+                return count, self.db.export_load_state()
+            return count, None
 
     def endless_insert_data(self, all_embeddings: list, all_metadata: list, left_id: int = 0) -> int:
         with self.db.init():
@@ -148,7 +150,7 @@ class SerialInsertRunner:
         return count
 
     @utils.time_it
-    def _insert_all_batches(self) -> int:
+    def _insert_all_batches(self) -> tuple[int, dict | None]:
         """Performance case only"""
         with concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context("spawn"),
@@ -204,9 +206,9 @@ class SerialInsertRunner:
         else:
             raise LoadTimeoutError(self.timeout)
 
-    def run(self) -> int:
-        count, _ = self._insert_all_batches()
-        return count
+    def run(self) -> tuple[int, dict | None]:
+        (count, load_state), _ = self._insert_all_batches()
+        return count, load_state
 
 
 class SerialSearchRunner:

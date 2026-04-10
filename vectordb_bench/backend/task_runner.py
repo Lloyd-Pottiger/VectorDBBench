@@ -191,13 +191,13 @@ class CaseRunner(BaseModel):
             if drop_old:
                 if TaskStage.LOAD in self.config.stages:
                     _, load_dur = self._load_train_data()
-                    build_dur = self._optimize()
+                    optimize_dur = self._optimize()
                     m.insert_duration = round(load_dur, 4)
-                    m.optimize_duration = round(build_dur, 4)
-                    m.load_duration = round(load_dur + build_dur, 4)
+                    m.optimize_duration = round(optimize_dur, 4)
+                    m.load_duration = round(load_dur + optimize_dur, 4)
                     log.info(
                         f"Finish loading the entire dataset into VectorDB,"
-                        f" insert_duration={load_dur}, optimize_duration={build_dur}"
+                        f" insert_duration={load_dur}, optimize_duration={optimize_dur}"
                         f" load_duration(insert + optimize) = {m.load_duration}"
                     )
                 else:
@@ -250,7 +250,10 @@ class CaseRunner(BaseModel):
                 self.ca.filters,
                 self.ca.load_timeout,
             )
-            runner.run()
+            count, load_state = runner.run()
+            if hasattr(self.db, "import_load_state"):
+                self.db.import_load_state(load_state)
+            return count
         except Exception as e:
             raise e from None
         finally:

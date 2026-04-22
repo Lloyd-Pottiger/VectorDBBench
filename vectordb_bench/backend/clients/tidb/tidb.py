@@ -303,19 +303,34 @@ class TiDB(VectorDB):
                 raise RuntimeError(msg)
 
             applied_base_ts = int(lifecycle.get("applied_base_ts", 0))
-            global_resolved_ts = int(lifecycle.get("global_resolved_ts", 0))
-            buffered_events = int(lifecycle.get("buffered_events", 0))
-            # barrier_ts comes from the helper probe table, so AppliedBaseTs may stay slightly behind it.
-            # Once the target table's resolved_ts has crossed the barrier and the worker buffer is empty,
-            # every earlier target-table write is already visible in the index.
-            if global_resolved_ts >= barrier_ts and buffered_events == 0:
+            global_resolved_ts_value = lifecycle.get("global_resolved_ts")
+            buffered_events_value = lifecycle.get("buffered_events")
+            global_resolved_ts = int(global_resolved_ts_value or 0)
+            buffered_events = int(buffered_events_value or 0)
+            # AppliedBaseTs is the authoritative read visibility watermark. If it has crossed
+            # the barrier, every earlier write is already visible through SPFresh search.
+            if applied_base_ts >= barrier_ts:
+                log.info(
+                    "TiDB/SPFresh async incremental catch-up reached barrier_ts=%s via applied_base_ts=%s "
+                    "global_resolved_ts=%s buffered_events=%s lag_seconds=%s runtime_state=%s",
+                    barrier_ts,
+                    applied_base_ts,
+                    global_resolved_ts_value,
+                    buffered_events_value,
+                    lifecycle.get("lag_seconds"),
+                    lifecycle.get("runtime_state"),
+                )
+                return
+            # Newer worker debug endpoints expose per-table resolved_ts and buffered event counts.
+            # When available, they can prove visibility slightly earlier than AppliedBaseTs alone.
+            if global_resolved_ts_value is not None and buffered_events_value is not None and global_resolved_ts >= barrier_ts and buffered_events == 0:
                 log.info(
                     "TiDB/SPFresh async incremental catch-up reached barrier_ts=%s applied_base_ts=%s "
                     "global_resolved_ts=%s buffered_events=%s lag_seconds=%s runtime_state=%s",
                     barrier_ts,
                     applied_base_ts,
-                    global_resolved_ts,
-                    buffered_events,
+                    global_resolved_ts_value,
+                    buffered_events_value,
                     lifecycle.get("lag_seconds"),
                     lifecycle.get("runtime_state"),
                 )

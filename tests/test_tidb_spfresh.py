@@ -296,6 +296,35 @@ class TestTiDBSPFresh:
                 poll_interval_seconds=0.01,
             )
 
+    def test_wait_for_incremental_catch_up_succeeds_when_applied_base_ts_crosses_barrier_without_new_debug_fields(self):
+        tidb = make_tidb()
+
+        with (
+            patch.object(
+                tidb,
+                "_fetch_incremental_lifecycle",
+                return_value=[
+                    {
+                        "table_id": 42,
+                        "index_id": 84,
+                        "runtime_state": "running",
+                        "applied_base_ts": 151,
+                        "lag_seconds": 0,
+                        "last_error": "",
+                    }
+                ],
+            ),
+            patch("vectordb_bench.backend.clients.tidb.tidb.time.sleep"),
+        ):
+            tidb._wait_for_incremental_catch_up(
+                barrier_ts=150,
+                table_id=42,
+                index_id=84,
+                timeout_seconds=1,
+                registration_timeout_seconds=1,
+                poll_interval_seconds=0.01,
+            )
+
     def test_wait_for_incremental_catch_up_fails_on_worker_error(self):
         tidb = make_tidb()
         with (

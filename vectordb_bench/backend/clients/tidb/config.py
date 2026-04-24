@@ -13,7 +13,6 @@ class TiDBConfigDict(TypedDict):
     database: str
     ssl_verify_cert: bool
     ssl_verify_identity: bool
-    worker_debug_url: str | None
 
 
 class TiDBConfig(DBConfig):
@@ -23,7 +22,6 @@ class TiDBConfig(DBConfig):
     port: int = 4000
     db_name: str = "test"
     ssl: bool = False
-    worker_debug_url: str | None = None
 
     def to_dict(self) -> TiDBConfigDict:
         pwd_str = self.password.get_secret_value()
@@ -35,7 +33,6 @@ class TiDBConfig(DBConfig):
             "database": self.db_name,
             "ssl_verify_cert": self.ssl,
             "ssl_verify_identity": self.ssl,
-            "worker_debug_url": self.worker_debug_url,
         }
 
     @validator("*")

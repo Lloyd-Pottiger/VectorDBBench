@@ -1,12 +1,10 @@
 import concurrent.futures
+from dataclasses import dataclass
 import io
-import json
 import logging
 import time
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
-from urllib.request import urlopen
 
 import pymysql
 
@@ -15,13 +13,24 @@ from .config import TiDBIndexConfig
 
 log = logging.getLogger(__name__)
 
-SPFRESH_INCREMENTAL_LIFECYCLE_PATH = "/debug/spfresh/incremental_lifecycle"
 SPFRESH_OPTIMIZE_TIMEOUT_SECONDS = 600.0
 SPFRESH_REGISTRATION_TIMEOUT_SECONDS = 30.0
 SPFRESH_POLL_INTERVAL_SECONDS = 1.0
-SPFRESH_REBUILD_STATE_KEYWORDS = ("rebuild", "backfill", "snapshot", "bootstrap", "initial")
-SPFRESH_FAILURE_STATE_KEYWORDS = ("fail", "error", "panic", "stopped")
+SPFRESH_INDEX_STATE_READY = "READY"
+SPFRESH_INDEX_STATE_BUILDING = "BUILDING"
+SPFRESH_INDEX_STATE_NEEDS_REBUILD = "NEEDS_REBUILD"
+SPFRESH_INDEX_STATE_UNKNOWN = "UNKNOWN"
 MAX_ALLOWED_PACKET_BYTES = 64 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class SPFreshIndexStatus:
+    applied_base_ts: int | None
+    index_state: str | None
+    is_ready: bool
+    lag_seconds: int | None
+    owner_lease_expire_ts: int | None
+    observed_at: Any
 
 
 class TiDB(VectorDB):
@@ -41,9 +50,6 @@ class TiDB(VectorDB):
         self.dim = dim
         self.conn = None  # To be inited by init()
         self.cursor = None  # To be inited by init()
-        self.worker_debug_url = self.db_config.pop("worker_debug_url", None)
-        self._cached_table_id: int | None = None
-        self._cached_index_id: int | None = None
         self._max_insert_commit_ts: int | None = None
 
         self.search_fn = db_case_config.search_param()["metric_fn"]
@@ -71,8 +77,6 @@ class TiDB(VectorDB):
                 yield conn, cursor
 
     def _drop_table(self):
-        self._cached_table_id = None
-        self._cached_index_id = None
         try:
             with self._get_connection() as (conn, cursor):
                 cursor.execute(f"DROP TABLE IF EXISTS {self.table_name}")
@@ -82,8 +86,6 @@ class TiDB(VectorDB):
             raise
 
     def _create_table(self):
-        self._cached_table_id = None
-        self._cached_index_id = None
         index_name = self._spfresh_index_name()
         metric_fn = self.case_config.index_param()["metric_fn"]
         try:
@@ -106,31 +108,21 @@ class TiDB(VectorDB):
     def optimize(self, data_size: int | None = None) -> None:
         if self.cursor is None or self.conn is None:
             raise RuntimeError("TiDB.optimize() must be called within `with self.init():`")
-        if not self.worker_debug_url:
-            raise RuntimeError(
-                "TiDB/SPFresh optimize requires --worker-debug-url because optimize_duration now waits "
-                "for async incremental catch-up instead of running ALTER TABLE ADD VECTOR INDEX.",
-            )
         if self._max_insert_commit_ts is None:
             log.info("Skipping TiDB/SPFresh optimize wait because no insert commit_ts was recorded during load")
             return
 
         barrier_ts = self._max_insert_commit_ts
-        table_id = self._resolve_table_id()
-        index_id = self._resolve_index_id()
+        index_name = self._spfresh_index_name()
 
         # For TiDB/SPFresh, optimize_duration is now the wait for async incremental catch-up, not DDL build time.
         log.info(
             "Waiting for TiDB/SPFresh async incremental catch-up: table=%s index=%s barrier_ts=%s",
-            table_id,
-            index_id,
+            self.table_name,
+            index_name,
             barrier_ts,
         )
-        self._wait_for_incremental_catch_up(
-            barrier_ts=barrier_ts,
-            table_id=table_id,
-            index_id=index_id,
-        )
+        self._wait_for_spfresh_ready(barrier_ts=barrier_ts)
         self._max_insert_commit_ts = None
 
     def export_load_state(self) -> dict[str, int] | None:
@@ -160,89 +152,30 @@ class TiDB(VectorDB):
             raise RuntimeError(msg)
         return int(row[0])
 
-    def _resolve_table_id(self) -> int:
-        if self._cached_table_id is not None:
-            return self._cached_table_id
+    def _fetch_spfresh_index_status(self) -> SPFreshIndexStatus | None:
         self.cursor.execute(
             """
-            SELECT tidb_table_id
-            FROM information_schema.tables
-            WHERE table_schema = DATABASE() AND table_name = %s
-            """,
-            (self.table_name,),
-        )
-        row = self.cursor.fetchone()
-        if row is None:
-            msg = f"Failed to resolve table_id for TiDB table {self.table_name}"
-            raise RuntimeError(msg)
-        self._cached_table_id = int(row[0])
-        return self._cached_table_id
-
-    def _resolve_index_id(self) -> int:
-        if self._cached_index_id is not None:
-            return self._cached_index_id
-        self.cursor.execute(
-            """
-            SELECT index_id
-            FROM information_schema.tidb_indexes
-            WHERE table_schema = DATABASE() AND table_name = %s AND key_name = %s
+            SELECT applied_base_ts, index_state, is_ready, lag_seconds, owner_lease_expire_ts, observed_at
+            FROM information_schema.TIDB_SPFRESH_INDEX_STATUS
+            WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s
             """,
             (self.table_name, self._spfresh_index_name()),
         )
         row = self.cursor.fetchone()
         if row is None:
-            msg = (
-                f"Failed to resolve index_id for TiDB/SPFresh index {self._spfresh_index_name()} "
-                f"on {self.table_name}"
-            )
-            raise RuntimeError(msg)
-        self._cached_index_id = int(row[0])
-        return self._cached_index_id
-
-    def _worker_lifecycle_url(self) -> str:
-        parsed = urlsplit(self.worker_debug_url)
-        if parsed.scheme not in {"http", "https"}:
-            msg = f"Invalid TiDB worker debug URL: {self.worker_debug_url}"
-            raise RuntimeError(msg)
-        if parsed.path.endswith(SPFRESH_INCREMENTAL_LIFECYCLE_PATH):
-            return self.worker_debug_url
-        path = parsed.path.rstrip("/") + SPFRESH_INCREMENTAL_LIFECYCLE_PATH
-        return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
-
-    def _fetch_incremental_lifecycle(self) -> list[dict[str, Any]]:
-        with urlopen(self._worker_lifecycle_url(), timeout=5) as response:  # noqa: S310
-            payload = json.loads(response.read().decode("utf-8"))
-
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            if all(key in payload for key in ("table_id", "index_id", "applied_base_ts")):
-                return [payload]
-            for value in payload.values():
-                if isinstance(value, list):
-                    return value
-        raise RuntimeError("Unexpected TiDB/SPFresh incremental lifecycle payload shape")
-
-    def _matching_incremental_lifecycle(
-        self,
-        rows: list[dict[str, Any]],
-        table_id: int,
-        index_id: int,
-    ) -> dict[str, Any] | None:
-        return next(
-            (
-                row
-                for row in rows
-                if int(row.get("table_id", -1)) == table_id and int(row.get("index_id", -1)) == index_id
-            ),
-            None,
+            return None
+        return SPFreshIndexStatus(
+            applied_base_ts=None if row[0] is None else int(row[0]),
+            index_state=None if row[1] is None else str(row[1]).upper(),
+            is_ready=bool(row[2]),
+            lag_seconds=None if row[3] is None else int(row[3]),
+            owner_lease_expire_ts=None if row[4] is None else int(row[4]),
+            observed_at=row[5],
         )
 
-    def _wait_for_incremental_catch_up(
+    def _wait_for_spfresh_ready(
         self,
         barrier_ts: int,
-        table_id: int,
-        index_id: int,
         timeout_seconds: float = SPFRESH_OPTIMIZE_TIMEOUT_SECONDS,
         registration_timeout_seconds: float = SPFRESH_REGISTRATION_TIMEOUT_SECONDS,
         poll_interval_seconds: float = SPFRESH_POLL_INTERVAL_SECONDS,
@@ -255,96 +188,64 @@ class TiDB(VectorDB):
             now = time.monotonic()
             if now > deadline:
                 msg = (
-                    f"Timed out waiting for TiDB/SPFresh incremental catch-up to barrier_ts={barrier_ts}; "
+                    f"Timed out waiting for TiDB/SPFresh status catch-up to barrier_ts={barrier_ts}; "
                     f"last_observed={last_observed}"
                 )
                 raise RuntimeError(msg)
 
-            rows = self._fetch_incremental_lifecycle()
-            lifecycle = self._matching_incremental_lifecycle(rows, table_id, index_id)
-            if lifecycle is None:
+            status = self._fetch_spfresh_index_status()
+            if status is None:
                 if now > registration_deadline:
                     msg = (
-                        f"TiDB/SPFresh worker never registered table_id={table_id} index_id={index_id} "
-                        f"before barrier_ts={barrier_ts}"
+                        f"TiDB/SPFresh status row never appeared for table={self.table_name} "
+                        f"index={self._spfresh_index_name()} before barrier_ts={barrier_ts}"
                     )
                     raise RuntimeError(msg)
                 time.sleep(poll_interval_seconds)
                 continue
 
             last_observed = {
-                "applied_base_ts": lifecycle.get("applied_base_ts"),
-                "global_resolved_ts": lifecycle.get("global_resolved_ts"),
-                "buffered_events": lifecycle.get("buffered_events"),
-                "lag_seconds": lifecycle.get("lag_seconds"),
-                "runtime_state": lifecycle.get("runtime_state"),
-                "last_error": lifecycle.get("last_error"),
+                "applied_base_ts": status.applied_base_ts,
+                "index_state": status.index_state,
+                "is_ready": int(status.is_ready),
+                "lag_seconds": status.lag_seconds,
+                "owner_lease_expire_ts": status.owner_lease_expire_ts,
+                "observed_at": status.observed_at,
             }
-            runtime_state = str(lifecycle.get("runtime_state", "")).lower()
-            last_error = lifecycle.get("last_error")
-
-            if last_error:
-                msg = (
-                    f"TiDB/SPFresh worker reported last_error while waiting for barrier_ts={barrier_ts}: "
-                    f"{last_error}"
-                )
+            if status.index_state == SPFRESH_INDEX_STATE_UNKNOWN:
+                msg = f"TiDB/SPFresh status became UNKNOWN while waiting for barrier_ts={barrier_ts}: {last_observed}"
                 raise RuntimeError(msg)
-            if any(keyword in runtime_state for keyword in SPFRESH_FAILURE_STATE_KEYWORDS):
+            if status.index_state == SPFRESH_INDEX_STATE_NEEDS_REBUILD:
                 msg = (
-                    f"TiDB/SPFresh worker entered failure runtime_state={lifecycle.get('runtime_state')} "
-                    f"while waiting for barrier_ts={barrier_ts}"
-                )
-                raise RuntimeError(msg)
-            if any(keyword in runtime_state for keyword in SPFRESH_REBUILD_STATE_KEYWORDS):
-                msg = (
-                    f"TiDB/SPFresh worker entered rebuild-like runtime_state={lifecycle.get('runtime_state')} "
-                    f"while waiting for barrier_ts={barrier_ts}"
+                    f"TiDB/SPFresh index entered NEEDS_REBUILD while waiting for barrier_ts={barrier_ts}: "
+                    f"{last_observed}"
                 )
                 raise RuntimeError(msg)
 
-            applied_base_ts = int(lifecycle.get("applied_base_ts", 0))
-            global_resolved_ts_value = lifecycle.get("global_resolved_ts")
-            buffered_events_value = lifecycle.get("buffered_events")
-            global_resolved_ts = int(global_resolved_ts_value or 0)
-            buffered_events = int(buffered_events_value or 0)
-            # AppliedBaseTs is the authoritative read visibility watermark. If it has crossed
-            # the barrier, every earlier write is already visible through SPFresh search.
-            if applied_base_ts >= barrier_ts:
+            if status.applied_base_ts is not None and status.applied_base_ts >= barrier_ts and status.is_ready:
                 log.info(
-                    "TiDB/SPFresh async incremental catch-up reached barrier_ts=%s via applied_base_ts=%s "
-                    "global_resolved_ts=%s buffered_events=%s lag_seconds=%s runtime_state=%s",
+                    "TiDB/SPFresh status reached barrier_ts=%s applied_base_ts=%s is_ready=%s "
+                    "lag_seconds=%s owner_lease_expire_ts=%s observed_at=%s index_state=%s",
                     barrier_ts,
-                    applied_base_ts,
-                    global_resolved_ts_value,
-                    buffered_events_value,
-                    lifecycle.get("lag_seconds"),
-                    lifecycle.get("runtime_state"),
-                )
-                return
-            # Newer worker debug endpoints expose per-table resolved_ts and buffered event counts.
-            # When available, they can prove visibility slightly earlier than AppliedBaseTs alone.
-            if global_resolved_ts_value is not None and buffered_events_value is not None and global_resolved_ts >= barrier_ts and buffered_events == 0:
-                log.info(
-                    "TiDB/SPFresh async incremental catch-up reached barrier_ts=%s applied_base_ts=%s "
-                    "global_resolved_ts=%s buffered_events=%s lag_seconds=%s runtime_state=%s",
-                    barrier_ts,
-                    applied_base_ts,
-                    global_resolved_ts_value,
-                    buffered_events_value,
-                    lifecycle.get("lag_seconds"),
-                    lifecycle.get("runtime_state"),
+                    status.applied_base_ts,
+                    int(status.is_ready),
+                    status.lag_seconds,
+                    status.owner_lease_expire_ts,
+                    status.observed_at,
+                    status.index_state,
                 )
                 return
 
             log.info(
-                "TiDB/SPFresh async incremental catch-up pending: barrier_ts=%s applied_base_ts=%s "
-                "global_resolved_ts=%s buffered_events=%s lag_seconds=%s runtime_state=%s",
+                "TiDB/SPFresh status catch-up pending: barrier_ts=%s applied_base_ts=%s "
+                "is_ready=%s lag_seconds=%s owner_lease_expire_ts=%s observed_at=%s index_state=%s",
                 barrier_ts,
-                applied_base_ts,
-                global_resolved_ts,
-                buffered_events,
-                lifecycle.get("lag_seconds"),
-                lifecycle.get("runtime_state"),
+                status.applied_base_ts,
+                int(status.is_ready),
+                status.lag_seconds,
+                status.owner_lease_expire_ts,
+                status.observed_at,
+                status.index_state,
             )
             time.sleep(poll_interval_seconds)
 

@@ -69,15 +69,6 @@ class TiDBTypedDict(CommonTypedDict):
             help="Enable or disable SSL, for TiDB Serverless SSL must be enabled",
         ),
     ]
-    worker_debug_url: Annotated[
-        str | None,
-        click.option(
-            "--worker-debug-url",
-            type=str,
-            default=None,
-            help="TiDB/SPFresh worker debug base URL or full incremental lifecycle endpoint URL",
-        ),
-    ]
 
 
 @cli.command()
@@ -97,7 +88,6 @@ def TiDB(
             port=parameters["port"],
             db_name=parameters["db_name"],
             ssl=parameters["ssl"],
-            worker_debug_url=parameters["worker_debug_url"],
         ),
         db_case_config=TiDBIndexConfig(),
         **parameters,

@@ -17,6 +17,13 @@ class Metric:
     insert_duration: float = 0.0
     optimize_duration: float = 0.0
     load_duration: float = 0.0  # insert + optimize
+    delete_duration: float = 0.0
+    delete_search_immediate_result_count: int = 0
+    delete_search_immediate_results: list[int] = field(default_factory=list)
+    delete_search_final_result_count: int = 0
+    delete_search_final_results: list[int] = field(default_factory=list)
+    delete_search_settle_duration: float = 0.0
+    delete_search_poll_count: int = 0
 
     # for performance cases
     qps: float = 0.0
@@ -51,6 +58,10 @@ class Metric:
 
 QURIES_PER_DOLLAR_METRIC = "QP$ (Quries per Dollar)"
 LOAD_DURATION_METRIC = "load_duration"
+DELETE_DURATION_METRIC = "delete_duration"
+DELETE_SEARCH_IMMEDIATE_RESULT_COUNT_METRIC = "delete_search_immediate_result_count"
+DELETE_SEARCH_FINAL_RESULT_COUNT_METRIC = "delete_search_final_result_count"
+DELETE_SEARCH_SETTLE_DURATION_METRIC = "delete_search_settle_duration"
 SERIAL_LATENCY_P99_METRIC = "serial_latency_p99"
 SERIAL_LATENCY_P95_METRIC = "serial_latency_p95"
 MAX_LOAD_COUNT_METRIC = "max_load_count"
@@ -59,6 +70,10 @@ RECALL_METRIC = "recall"
 
 metric_unit_map = {
     LOAD_DURATION_METRIC: "s",
+    DELETE_DURATION_METRIC: "s",
+    DELETE_SEARCH_IMMEDIATE_RESULT_COUNT_METRIC: "",
+    DELETE_SEARCH_FINAL_RESULT_COUNT_METRIC: "",
+    DELETE_SEARCH_SETTLE_DURATION_METRIC: "s",
     SERIAL_LATENCY_P99_METRIC: "ms",
     SERIAL_LATENCY_P95_METRIC: "ms",
     MAX_LOAD_COUNT_METRIC: "K",
@@ -67,6 +82,8 @@ metric_unit_map = {
 
 lower_is_better_metrics = [
     LOAD_DURATION_METRIC,
+    DELETE_DURATION_METRIC,
+    DELETE_SEARCH_SETTLE_DURATION_METRIC,
     SERIAL_LATENCY_P99_METRIC,
     SERIAL_LATENCY_P95_METRIC,
 ]
@@ -75,6 +92,10 @@ metric_order = [
     QPS_METRIC,
     RECALL_METRIC,
     LOAD_DURATION_METRIC,
+    DELETE_DURATION_METRIC,
+    DELETE_SEARCH_IMMEDIATE_RESULT_COUNT_METRIC,
+    DELETE_SEARCH_FINAL_RESULT_COUNT_METRIC,
+    DELETE_SEARCH_SETTLE_DURATION_METRIC,
     SERIAL_LATENCY_P99_METRIC,
     SERIAL_LATENCY_P95_METRIC,
     MAX_LOAD_COUNT_METRIC,

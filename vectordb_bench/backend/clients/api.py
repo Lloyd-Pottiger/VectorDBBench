@@ -217,6 +217,18 @@ class VectorDB(ABC):
         """
         raise NotImplementedError
 
+    def delete_embeddings(
+        self,
+        ids: list[int],
+        **kwargs,
+    ) -> tuple[int, Exception | None]:
+        """Delete embeddings from the vector database.
+
+        Implementations may delete one ID per statement or use any other strategy that
+        matches the benchmark semantics required by the database-specific runner.
+        """
+        raise NotImplementedError(f"{self.name} does not support delete benchmark")
+
     @abstractmethod
     def search_embedding(
         self,

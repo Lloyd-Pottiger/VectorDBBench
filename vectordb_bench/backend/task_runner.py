@@ -2,6 +2,7 @@ import concurrent
 import hashlib
 import logging
 import re
+import time
 import traceback
 from enum import Enum, auto
 
@@ -15,7 +16,13 @@ from . import utils
 from .cases import Case, CaseLabel, StreamingPerformanceCase
 from .clients import DB, MetricType, api
 from .data_source import DatasetSource
-from .runner import MultiProcessingSearchRunner, ReadWriteRunner, SerialInsertRunner, SerialSearchRunner
+from .runner import (
+    MultiProcessingSearchRunner,
+    ReadWriteRunner,
+    SerialDeleteRunner,
+    SerialInsertRunner,
+    SerialSearchRunner,
+)
 
 log = logging.getLogger(__name__)
 
@@ -134,10 +141,24 @@ class CaseRunner(BaseModel):
     def _pre_run(self, drop_old: bool = True):
         try:
             self.init_db(drop_old)
-            self.ca.dataset.prepare(self.dataset_source, filters=self.ca.filters)
+            if self.ca.label != CaseLabel.Performance or self._requires_perf_dataset_prepare():
+                self.ca.dataset.prepare(self.dataset_source, filters=self.ca.filters)
+            else:
+                log.info("Dataset preparation skipped")
         except ModuleNotFoundError as e:
             log.warning(f"pre run case error: please install client for db: {self.config.db}, error={e}")
             raise e from None
+
+    def _requires_perf_dataset_prepare(self) -> bool:
+        return any(
+            stage in self.config.stages
+            for stage in (
+                TaskStage.LOAD,
+                TaskStage.DELETE,
+                TaskStage.SEARCH_SERIAL,
+                TaskStage.SEARCH_CONCURRENT,
+            )
+        )
 
     def run(self, drop_old: bool = True) -> Metric:
         log.info("Starting run")
@@ -182,7 +203,8 @@ class CaseRunner(BaseModel):
         """run performance cases
 
         Returns:
-            Metric: load_duration, recall, serial_latency_p99, and, qps
+            Metric: load_duration/delete_duration, post-delete checks, recall,
+                serial_latency_p99, and qps
         """
 
         log.info("Start performance case")
@@ -202,6 +224,39 @@ class CaseRunner(BaseModel):
                     )
                 else:
                     log.info("Data loading skipped")
+            if TaskStage.BUILD in self.config.stages and TaskStage.LOAD not in self.config.stages:
+                build_dur = self._optimize()
+                m.optimize_duration = round(build_dur, 4)
+                log.info(f"Finish building VectorDB index, optimize_duration={build_dur}")
+            if TaskStage.DELETE in self.config.stages:
+                _, delete_dur = self._delete_data()
+                m.delete_duration = round(delete_dur, 4)
+                log.info(f"Finish deleting the entire dataset from VectorDB, delete_duration={delete_dur}")
+                (
+                    immediate_results,
+                    final_results,
+                    settle_duration,
+                    poll_count,
+                    deadline_exceeded,
+                ) = self._verify_search_after_delete()
+                m.delete_search_immediate_results = immediate_results
+                m.delete_search_immediate_result_count = len(immediate_results)
+                m.delete_search_final_results = final_results
+                m.delete_search_final_result_count = len(final_results)
+                m.delete_search_settle_duration = round(settle_duration, 4)
+                m.delete_search_poll_count = poll_count
+                log.info(
+                    "Post-delete ANN search finished, immediate_count=%s, immediate_results=%s, "
+                    "final_count=%s, final_results=%s, settle_duration=%s, polls=%s",
+                    m.delete_search_immediate_result_count,
+                    m.delete_search_immediate_results,
+                    m.delete_search_final_result_count,
+                    m.delete_search_final_results,
+                    m.delete_search_settle_duration,
+                    m.delete_search_poll_count,
+                )
+                if deadline_exceeded:
+                    self._raise_post_delete_verification_error(final_results)
             if TaskStage.SEARCH_SERIAL in self.config.stages or TaskStage.SEARCH_CONCURRENT in self.config.stages:
                 self._init_search_runner()
                 if TaskStage.SEARCH_CONCURRENT in self.config.stages:
@@ -258,6 +313,93 @@ class CaseRunner(BaseModel):
             raise e from None
         finally:
             runner = None
+
+    @utils.time_it
+    def _delete_data(self):
+        """Delete train data and get the delete_duration"""
+        try:
+            delete_timeout = getattr(self.config.db_case_config, "delete_timeout", None)
+            if delete_timeout is None:
+                delete_timeout = self.ca.optimize_timeout
+            runner = SerialDeleteRunner(
+                self.db,
+                self.ca.dataset,
+                delete_timeout,
+            )
+            count, delete_state = runner.run()
+            if hasattr(self.db, "import_delete_state"):
+                self.db.import_delete_state(delete_state)
+            return count
+        except Exception as e:
+            raise e from None
+        finally:
+            runner = None
+
+    def _get_delete_search_query(self) -> list[float]:
+        assert self.db is not None
+
+        if self.normalize:
+            query = np.array(self.ca.dataset.test_data[0])
+            query = query / np.linalg.norm(query)
+            return query.tolist()
+        return self.ca.dataset.test_data[0]
+
+    def _search_once_after_delete(self, search_query: list[float]) -> list[int]:
+        assert self.db is not None
+        try:
+            with self.db.init():
+                self.db.prepare_filter(self.ca.filters)
+                return self.db.search_embedding(search_query, k=1)
+        except Exception as e:
+            log.exception("Post-delete ANN search failed, aborting delete benchmark")
+            raise RuntimeError("Post-delete ANN search failed") from e
+
+    @staticmethod
+    def _raise_post_delete_verification_error(final_results: list[int]) -> None:
+        msg = "Post-delete ANN verification did not become empty before the deadline, " f"final_results={final_results}"
+        raise RuntimeError(msg)
+
+    def _wait_post_delete_ann_ready(self, wait_timeout: float, poll_interval: float) -> None:
+        assert self.db is not None
+
+        wait_spfresh_post_delete_catchup = getattr(self.db, "wait_spfresh_post_delete_catchup", None)
+        if wait_spfresh_post_delete_catchup is None:
+            return
+
+        try:
+            barrier_ts = wait_spfresh_post_delete_catchup(wait_timeout, poll_interval)
+        except Exception as e:
+            log.exception("Post-delete SPFRESH catch-up failed before ANN search")
+            raise RuntimeError("Post-delete SPFRESH catch-up failed before ANN search") from e
+
+        if barrier_ts is not None:
+            log.info(
+                "SPFRESH incremental apply caught up before post-delete ANN search, "
+                "delete_commit_barrier_ts=%s",
+                barrier_ts,
+            )
+
+    def _verify_search_after_delete(self) -> tuple[list[int], list[int], float, int, bool]:
+        """Record immediate post-delete ANN results, then wait for eventual empty results."""
+        search_query = self._get_delete_search_query()
+        wait_timeout = float(getattr(self.config.db_case_config, "delete_search_wait_timeout", 30.0))
+        poll_interval = float(getattr(self.config.db_case_config, "delete_search_poll_interval", 1.0))
+
+        self._wait_post_delete_ann_ready(wait_timeout, poll_interval)
+
+        immediate_results = self._search_once_after_delete(search_query)
+        deadline = time.perf_counter() + wait_timeout
+        poll_count = 1
+        final_results = immediate_results
+        start = time.perf_counter()
+
+        while final_results and time.perf_counter() < deadline:
+            time.sleep(poll_interval)
+            final_results = self._search_once_after_delete(search_query)
+            poll_count += 1
+
+        deadline_exceeded = bool(final_results)
+        return immediate_results, final_results, time.perf_counter() - start, poll_count, deadline_exceeded
 
     def _serial_search(self) -> tuple[float, float, float, float]:
         """Performance serial tests, search the entire test data once,

@@ -211,6 +211,70 @@ class SerialInsertRunner:
         return count, load_state
 
 
+class SerialDeleteRunner:
+    def __init__(
+        self,
+        db: api.VectorDB,
+        dataset: DatasetManager,
+        timeout: float | None = None,
+    ):
+        self.timeout = timeout if isinstance(timeout, int | float) else None
+        self.dataset = dataset
+        self.db = db
+
+    def task(self) -> tuple[int, dict | None]:
+        count = 0
+        with self.db.init():
+            log.info(f"({mp.current_process().name:16}) Start deleting embeddings from VectorDB")
+            start = time.perf_counter()
+            for data_df in self.dataset:
+                batch_ids = data_df[self.dataset.data.train_id_field].tolist()
+                delete_count, error = self.db.delete_embeddings(ids=batch_ids)
+                if error is not None:
+                    msg = f"Delete failed with explicit error return: {error}"
+                    raise RuntimeError(msg) from error
+                if delete_count != len(batch_ids):
+                    msg = f"Delete count mismatch, expected={len(batch_ids)}, actual={delete_count}"
+                    raise RuntimeError(msg)
+
+                count += delete_count
+                if count % 100_000 == 0:
+                    log.info(f"({mp.current_process().name:16}) Deleted {count} embeddings from VectorDB")
+
+            log.info(
+                f"({mp.current_process().name:16}) Finish deleting the dataset from VectorDB, "
+                f"dur={time.perf_counter() - start}"
+            )
+            if hasattr(self.db, "export_delete_state"):
+                return count, self.db.export_delete_state()
+            return count, None
+
+    @utils.time_it
+    def _delete_all_batches(self) -> tuple[int, dict | None]:
+        with concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context("spawn"),
+            max_workers=1,
+        ) as executor:
+            future = executor.submit(self.task)
+            try:
+                count = future.result(timeout=self.timeout)
+            except TimeoutError as e:
+                msg = f"VectorDB delete dataset timeout in {self.timeout}"
+                log.warning(msg)
+                for pid, _ in executor._processes.items():
+                    psutil.Process(pid).kill()
+                raise PerformanceTimeoutError(msg) from e
+            except Exception as e:
+                log.warning(f"VectorDB delete dataset error: {e}")
+                raise e from e
+            else:
+                return count
+
+    def run(self) -> tuple[int, dict | None]:
+        (count, delete_state), _ = self._delete_all_batches()
+        return count, delete_state
+
+
 class SerialSearchRunner:
     def __init__(
         self,

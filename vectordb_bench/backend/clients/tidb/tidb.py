@@ -16,8 +16,6 @@ log = logging.getLogger(__name__)
 SPFRESH_OPTIMIZE_TIMEOUT_SECONDS = 600.0
 SPFRESH_REGISTRATION_TIMEOUT_SECONDS = 30.0
 SPFRESH_POLL_INTERVAL_SECONDS = 1.0
-SPFRESH_INDEX_STATE_READY = "READY"
-SPFRESH_INDEX_STATE_BUILDING = "BUILDING"
 SPFRESH_INDEX_STATE_NEEDS_REBUILD = "NEEDS_REBUILD"
 SPFRESH_INDEX_STATE_UNKNOWN = "UNKNOWN"
 MAX_ALLOWED_PACKET_BYTES = 64 * 1024 * 1024
@@ -51,6 +49,7 @@ class TiDB(VectorDB):
         self.conn = None  # To be inited by init()
         self.cursor = None  # To be inited by init()
         self._max_insert_commit_ts: int | None = None
+        self._max_delete_commit_ts: int | None = None
 
         self.search_fn = db_case_config.search_param()["metric_fn"]
 
@@ -86,36 +85,40 @@ class TiDB(VectorDB):
             raise
 
     def _create_table(self):
-        index_name = self._spfresh_index_name()
-        metric_fn = self.case_config.index_param()["metric_fn"]
+        index_sql = ""
+        if self.case_config.build_spfresh_index:
+            index_sql = f",\n                        {self._spfresh_index_definition()}"
+
         try:
             with self._get_connection() as (conn, cursor):
-                cursor.execute(f"""
+                cursor.execute(
+                    f"""
                     CREATE TABLE {self.table_name} (
                         id BIGINT PRIMARY KEY,
-                        embedding VECTOR({self.dim}) NOT NULL,
-                        VECTOR INDEX {index_name} (({metric_fn}(embedding))) USING SPFRESH
+                        embedding VECTOR({self.dim}) NOT NULL
+                        {index_sql}
                     );
-                    """)
+                    """
+                )
                 conn.commit()
         except Exception as e:
             log.warning("Failed to create table: %s error: %s", self.table_name, e)
             raise
 
     def ready_to_load(self) -> bool:
-        pass
+        return True
 
     def optimize(self, data_size: int | None = None) -> None:
         if self.cursor is None or self.conn is None:
             raise RuntimeError("TiDB.optimize() must be called within `with self.init():`")
-        if self._max_insert_commit_ts is None:
-            log.info("Skipping TiDB/SPFresh optimize wait because no insert commit_ts was recorded during load")
+        if not self.case_config.build_spfresh_index:
+            log.info("Skipping TiDB/SPFresh optimize wait because SPFRESH index creation is disabled")
             return
-
         barrier_ts = self._max_insert_commit_ts
+        if barrier_ts is None:
+            barrier_ts = self._current_tso_marker()
         index_name = self._spfresh_index_name()
 
-        # For TiDB/SPFresh, optimize_duration is now the wait for async incremental catch-up, not DDL build time.
         log.info(
             "Waiting for TiDB/SPFresh async incremental catch-up: table=%s index=%s barrier_ts=%s",
             self.table_name,
@@ -136,6 +139,17 @@ class TiDB(VectorDB):
             return
         self._max_insert_commit_ts = int(state["max_insert_commit_ts"])
 
+    def export_delete_state(self) -> dict[str, int] | None:
+        if self._max_delete_commit_ts is None:
+            return None
+        return {"max_delete_commit_ts": self._max_delete_commit_ts}
+
+    def import_delete_state(self, state: dict[str, int] | None) -> None:
+        if not state:
+            self._max_delete_commit_ts = None
+            return
+        self._max_delete_commit_ts = int(state["max_delete_commit_ts"])
+
     def _spfresh_index_name(self) -> str:
         metric_suffix = (
             getattr(self.case_config.metric_type, "value", str(self.case_config.metric_type)).lower()
@@ -144,6 +158,10 @@ class TiDB(VectorDB):
         )
         return f"idx_embedding_spfresh_{metric_suffix}"
 
+    def _spfresh_index_definition(self) -> str:
+        metric_fn = self.case_config.index_param()["metric_fn"]
+        return f"VECTOR INDEX {self._spfresh_index_name()} (({metric_fn}(embedding))) USING SPFRESH"
+
     def _last_commit_ts(self, cursor: Any) -> int:
         cursor.execute("SELECT json_extract(@@tidb_last_txn_info, '$.commit_ts')")
         row = cursor.fetchone()
@@ -151,6 +169,24 @@ class TiDB(VectorDB):
             msg = "Failed to read TiDB commit_ts from @@tidb_last_txn_info"
             raise RuntimeError(msg)
         return int(row[0])
+
+    def _current_tso_marker(self) -> int:
+        self.cursor.execute("BEGIN")
+        self.cursor.execute("SELECT @@tidb_current_ts")
+        row = self.cursor.fetchone()
+        self.conn.commit()
+        if row is None or row[0] is None:
+            msg = "Failed to read TiDB current TSO marker from @@tidb_current_ts"
+            raise RuntimeError(msg)
+        return int(row[0])
+
+    @staticmethod
+    def _max_commit_ts(current: int | None, candidate: int | None) -> int | None:
+        if candidate is None:
+            return current
+        if current is None or candidate > current:
+            return candidate
+        return current
 
     def _fetch_spfresh_index_status(self) -> SPFreshIndexStatus | None:
         self.cursor.execute(
@@ -249,6 +285,43 @@ class TiDB(VectorDB):
             )
             time.sleep(poll_interval_seconds)
 
+    def wait_spfresh_post_delete_catchup(
+        self,
+        timeout: float,
+        poll_interval: float,
+    ) -> int | None:
+        if not self.case_config.build_spfresh_index:
+            log.info("Skipping post-delete SPFRESH catch-up because SPFRESH index creation is disabled")
+            return None
+        if self._max_delete_commit_ts is None:
+            log.info("Skipping post-delete SPFRESH catch-up because no delete commit_ts was recorded")
+            return None
+
+        barrier_ts = self._max_delete_commit_ts
+        log.info(
+            "Waiting for post-delete TiDB/SPFresh catch-up: table=%s index=%s barrier_ts=%s",
+            self.table_name,
+            self._spfresh_index_name(),
+            barrier_ts,
+        )
+
+        if self.cursor is not None:
+            self._wait_for_spfresh_ready(
+                barrier_ts=barrier_ts,
+                timeout_seconds=timeout,
+                poll_interval_seconds=poll_interval,
+            )
+        else:
+            with self.init():
+                self._wait_for_spfresh_ready(
+                    barrier_ts=barrier_ts,
+                    timeout_seconds=timeout,
+                    poll_interval_seconds=poll_interval,
+                )
+
+        self._max_delete_commit_ts = None
+        return barrier_ts
+
     def _insert_embeddings_serial(
         self,
         embeddings: list[list[float]],
@@ -295,12 +368,42 @@ class TiDB(VectorDB):
             max_commit_ts = self._max_insert_commit_ts
             for future in done:
                 commit_ts = future.result()
-                if max_commit_ts is None or commit_ts > max_commit_ts:
-                    max_commit_ts = commit_ts
+                max_commit_ts = self._max_commit_ts(max_commit_ts, commit_ts)
             for future in pending:
                 future.cancel()
         self._max_insert_commit_ts = max_commit_ts
         return len(metadata), None
+
+    def delete_embeddings(
+        self,
+        ids: list[int],
+        **kwargs: Any,
+    ) -> tuple[int, Exception | None]:
+        if self.cursor is None or self.conn is None:
+            raise RuntimeError("TiDB.delete_embeddings() must be called within `with self.init():`")
+
+        deleted = 0
+        delete_sql = f"DELETE FROM {self.table_name} WHERE id = %s"  # noqa: S608
+        commit_interval = self.case_config.delete_commit_interval
+        max_commit_ts = self._max_delete_commit_ts
+
+        try:
+            for idx, row_id in enumerate(ids, start=1):
+                deleted += self.cursor.execute(delete_sql, (row_id,))
+                if idx % commit_interval == 0:
+                    self.conn.commit()
+                    max_commit_ts = self._max_commit_ts(max_commit_ts, self._last_commit_ts(self.cursor))
+
+            if len(ids) % commit_interval != 0:
+                self.conn.commit()
+                max_commit_ts = self._max_commit_ts(max_commit_ts, self._last_commit_ts(self.cursor))
+        except Exception as e:
+            self.conn.rollback()
+            log.warning("Failed to delete data from table: %s", e)
+            raise
+
+        self._max_delete_commit_ts = max_commit_ts
+        return deleted, None
 
     def search_embedding(
         self,

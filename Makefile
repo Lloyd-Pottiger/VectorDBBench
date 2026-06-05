@@ -16,8 +16,14 @@ lint:
 load-search-1m-local:
 	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh --case-type Performance768D1M
 
+load-search-1m-non-inline-local:
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh-non-inline --case-type Performance768D1M --spfresh-build-mode non-inline $(ARGS)
+
+load-search-1m-split-local:
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh-split --case-type Performance768D1M --spfresh-build-mode split --spfresh-split-ratio 0.8 $(ARGS)
+
 build:
-	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh-build --case-type Performance768D1M --skip-load --skip-drop-old --build --skip-search-concurrent $(ARGS)
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh-build --case-type Performance768D1M --skip-load --skip-drop-old --build --skip-search-concurrent --spfresh-build-mode non-inline $(ARGS)
 
 search-1m-local:
 	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh --case-type Performance768D1M --skip-load --skip-drop-old

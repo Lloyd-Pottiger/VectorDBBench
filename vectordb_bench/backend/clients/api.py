@@ -227,7 +227,8 @@ class VectorDB(ABC):
         Implementations may delete one ID per statement or use any other strategy that
         matches the benchmark semantics required by the database-specific runner.
         """
-        raise NotImplementedError(f"{self.name} does not support delete benchmark")
+        msg = f"{self.name} does not support delete benchmark"
+        raise NotImplementedError(msg)
 
     @abstractmethod
     def search_embedding(
@@ -255,6 +256,8 @@ class VectorDB(ABC):
         heavy performance cases.
 
         Time(insert the dataset) + Time(optimize) will be recorded as "load_duration" metric
-        Optimize's execution time is limited, the limited time is based on cases.
+        for most database clients. Database-specific clients may return structured timing
+        details for specialized build or catch-up phases. Optimize's execution time is
+        limited, the limited time is based on cases.
         """
         raise NotImplementedError

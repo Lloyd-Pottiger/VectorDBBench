@@ -413,6 +413,10 @@ class TestResult(BaseModel):
         max_db_labels = max(map(len, [f.task_config.db_config.db_label for f in filtered_results])) + 3
         max_case = max(map(len, [f.task_config.case_config.case_name for f in filtered_results]))
         max_load_dur = max(map(len, [str(f.metrics.load_duration) for f in filtered_results])) + 3
+        max_spfresh_build = max(map(len, [str(f.metrics.spfresh_build_duration) for f in filtered_results])) + 3
+        max_spfresh_catchup = (
+            max(map(len, [str(f.metrics.spfresh_incremental_catchup_duration) for f in filtered_results])) + 3
+        )
         max_delete_dur = max(map(len, [str(f.metrics.delete_duration) for f in filtered_results])) + 3
         max_delete_qry_now = (
             max(map(len, [str(f.metrics.delete_search_immediate_result_count) for f in filtered_results])) + 3
@@ -426,6 +430,8 @@ class TestResult(BaseModel):
 
         max_db_labels = 8 if max_db_labels < 8 else max_db_labels
         max_load_dur = 11 if max_load_dur < 11 else max_load_dur
+        max_spfresh_build = 13 if max_spfresh_build < 13 else max_spfresh_build
+        max_spfresh_catchup = 15 if max_spfresh_catchup < 15 else max_spfresh_catchup
         max_delete_dur = 11 if max_delete_dur < 11 else max_delete_dur
         max_delete_qry_now = 11 if max_delete_qry_now < 11 else max_delete_qry_now
         max_delete_qry_final = 11 if max_delete_qry_final < 11 else max_delete_qry_final
@@ -439,6 +445,8 @@ class TestResult(BaseModel):
             max_case,
             len(self.task_label),
             max_load_dur,
+            max_spfresh_build,
+            max_spfresh_catchup,
             max_delete_dur,
             max_delete_qry_now,
             max_delete_qry_final,
@@ -453,7 +461,8 @@ class TestResult(BaseModel):
 
         DATA_FORMAT = (  # noqa: N806
             f"%-{max_db}s | %-{max_db_labels}s %-{max_case}s %-{len(self.task_label)}s"
-            f" | %-{max_load_dur}s %-{max_delete_dur}s %-{max_delete_qry_now}s %-{max_delete_qry_final}s"
+            f" | %-{max_load_dur}s %-{max_spfresh_build}s %-{max_spfresh_catchup}s"
+            f" %-{max_delete_dur}s %-{max_delete_qry_now}s %-{max_delete_qry_final}s"
             f" %-{max_delete_settle}s"
             f" %-{max_qps}s %-15s %-15s %-{max_recall}s %-14s"
             f" | %-5s"
@@ -465,6 +474,8 @@ class TestResult(BaseModel):
             "case",
             "label",
             "load_dur",
+            "spfresh_build",
+            "spfresh_catchup",
             "delete_dur",
             "delete_now",
             "delete_final",
@@ -492,6 +503,8 @@ class TestResult(BaseModel):
                     f.task_config.case_config.case_name,
                     self.task_label,
                     f.metrics.load_duration,
+                    f.metrics.spfresh_build_duration,
+                    f.metrics.spfresh_incremental_catchup_duration,
                     f.metrics.delete_duration,
                     f.metrics.delete_search_immediate_result_count,
                     f.metrics.delete_search_final_result_count,

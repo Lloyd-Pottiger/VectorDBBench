@@ -1,4 +1,5 @@
-from typing import TypedDict
+from enum import Enum
+from typing import Any, TypedDict
 
 from pydantic import BaseModel, SecretStr, validator
 
@@ -46,9 +47,17 @@ class TiDBConfig(DBConfig):
         return v
 
 
+class SPFreshBuildMode(str, Enum):
+    INLINE = "inline"
+    NON_INLINE = "non-inline"
+    SPLIT = "split"
+
+
 class TiDBIndexConfig(BaseModel, DBCaseConfig):
     metric_type: MetricType | None = None
     build_spfresh_index: bool = True
+    spfresh_build_mode: SPFreshBuildMode = SPFreshBuildMode.INLINE
+    spfresh_split_ratio: float = 0.8
     delete_commit_interval: int = 1000
     delete_timeout: float | None = None
     delete_search_wait_timeout: float = 30.0
@@ -60,12 +69,19 @@ class TiDBIndexConfig(BaseModel, DBCaseConfig):
             raise ValueError("delete_commit_interval must be >= 1")
         return v
 
+    @validator("spfresh_split_ratio")
+    def validate_spfresh_split_ratio(cls, v: float):
+        if v <= 0 or v >= 1:
+            raise ValueError("spfresh_split_ratio must be > 0 and < 1")
+        return v
+
     @validator("delete_timeout", "delete_search_wait_timeout", "delete_search_poll_interval")
-    def validate_positive_delete_search_window(cls, v: float, field):
+    def validate_positive_delete_search_window(cls, v: float, field: Any):
         if v is None and field.name == "delete_timeout":
             return v
         if v <= 0:
-            raise ValueError(f"{field.name} must be > 0")
+            msg = f"{field.name} must be > 0"
+            raise ValueError(msg)
         return v
 
     def get_metric_fn(self) -> str:
@@ -79,6 +95,8 @@ class TiDBIndexConfig(BaseModel, DBCaseConfig):
     def index_param(self) -> dict:
         return {
             "build_spfresh_index": self.build_spfresh_index,
+            "spfresh_build_mode": self.spfresh_build_mode.value,
+            "spfresh_split_ratio": self.spfresh_split_ratio,
             "metric_fn": self.get_metric_fn(),
         }
 

@@ -2,11 +2,13 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from vectordb_bench.backend.clients import DB
 from vectordb_bench.backend.clients.api import MetricType
 from vectordb_bench.backend.clients.tidb.config import TiDBIndexConfig
 from vectordb_bench.backend.clients.tidb.tidb import TiDB
 from vectordb_bench.backend.task_runner import CaseRunner
 from vectordb_bench.cli.cli import parse_task_stages
+from vectordb_bench.metric import Metric, OptimizeResult
 from vectordb_bench.models import TaskStage
 
 
@@ -501,6 +503,118 @@ def test_case_runner_perf_case_runs_build_only_stage():
 
     assert optimize_calls == ["optimize"]
     assert metric.optimize_duration == 1.2346
+
+
+def test_case_runner_inline_spfresh_catchup_duration_starts_before_insert():
+    case_runner = CaseRunner.construct(
+        run_id="run",
+        config=SimpleNamespace(
+            db=DB.TiDB,
+            db_case_config=TiDBIndexConfig(metric_type=MetricType.COSINE),
+            stages=[TaskStage.LOAD],
+        ),
+        ca=SimpleNamespace(dataset=SimpleNamespace(data=SimpleNamespace(size=100)), filters=None, load_timeout=None),
+        status=None,
+        dataset_source=None,
+        db=None,
+    )
+    object.__setattr__(case_runner, "_load_train_data", lambda: (100, 4.0))
+    object.__setattr__(
+        case_runner,
+        "_optimize",
+        lambda: OptimizeResult(optimize_duration=1.0, spfresh_incremental_catchup_duration=1.0),
+    )
+
+    with patch("vectordb_bench.backend.task_runner.time.perf_counter", side_effect=[10.0, 17.0]):
+        metric = case_runner._run_perf_case(drop_old=True)
+
+    assert metric.insert_duration == 4.0
+    assert metric.spfresh_build_duration == 0.0
+    assert metric.spfresh_incremental_catchup_duration == 7.0
+    assert metric.optimize_duration == 7.0
+    assert metric.load_duration == 7.0
+
+
+def test_case_runner_non_inline_spfresh_records_only_build_duration():
+    case_runner = CaseRunner.construct(
+        run_id="run",
+        config=SimpleNamespace(
+            db=DB.TiDB,
+            db_case_config=TiDBIndexConfig(
+                metric_type=MetricType.COSINE,
+                spfresh_build_mode="non-inline",
+            ),
+            stages=[TaskStage.LOAD],
+        ),
+        ca=SimpleNamespace(dataset=SimpleNamespace(data=SimpleNamespace(size=100)), filters=None, load_timeout=None),
+        status=None,
+        dataset_source=None,
+        db=None,
+    )
+    object.__setattr__(case_runner, "_load_train_data", lambda: (100, 4.0))
+    object.__setattr__(
+        case_runner,
+        "_optimize",
+        lambda: OptimizeResult(optimize_duration=3.0, spfresh_build_duration=3.0),
+    )
+
+    metric = case_runner._run_perf_case(drop_old=True)
+
+    assert metric.insert_duration == 4.0
+    assert metric.spfresh_build_duration == 3.0
+    assert metric.spfresh_incremental_catchup_duration == 0.0
+    assert metric.optimize_duration == 3.0
+    assert metric.load_duration == 7.0
+
+
+def test_case_runner_split_spfresh_records_catchup_from_delta_insert_start():
+    case_runner = CaseRunner.construct(
+        run_id="run",
+        config=SimpleNamespace(
+            db=DB.TiDB,
+            db_case_config=TiDBIndexConfig(
+                metric_type=MetricType.COSINE,
+                spfresh_build_mode="split",
+                spfresh_split_ratio=0.8,
+            ),
+        ),
+        ca=SimpleNamespace(dataset=SimpleNamespace(data=SimpleNamespace(size=100)), filters=None, load_timeout=None),
+        status=None,
+        dataset_source=None,
+        db=None,
+    )
+    load_calls = []
+
+    def fake_load_train_data(start_offset: int = 0, limit: int | None = None) -> tuple[int, float]:
+        load_calls.append((start_offset, limit))
+        if start_offset == 0:
+            return 80, 4.0
+        return 20, 2.0
+
+    object.__setattr__(case_runner, "_load_train_data", fake_load_train_data)
+    object.__setattr__(
+        case_runner,
+        "_build_spfresh_index",
+        lambda: OptimizeResult(optimize_duration=3.0, spfresh_build_duration=3.0),
+    )
+    object.__setattr__(
+        case_runner,
+        "_wait_spfresh_incremental_catchup",
+        lambda: OptimizeResult(optimize_duration=1.0, spfresh_incremental_catchup_duration=1.0),
+    )
+
+    metric = Metric()
+    with patch("vectordb_bench.backend.task_runner.time.perf_counter", side_effect=[10.0, 18.0]):
+        case_runner._run_spfresh_split_load(metric)
+
+    assert load_calls == [(0, 80), (80, 20)]
+    assert metric.spfresh_base_insert_duration == 4.0
+    assert metric.spfresh_delta_insert_duration == 2.0
+    assert metric.insert_duration == 6.0
+    assert metric.spfresh_build_duration == 3.0
+    assert metric.spfresh_incremental_catchup_duration == 8.0
+    assert metric.optimize_duration == 11.0
+    assert metric.load_duration == 15.0
 
 
 def test_case_runner_verify_search_after_delete_raises_immediately_on_query_error():

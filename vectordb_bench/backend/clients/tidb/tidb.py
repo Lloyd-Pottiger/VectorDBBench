@@ -1,15 +1,16 @@
 import concurrent.futures
-from dataclasses import dataclass
 import io
 import logging
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import pymysql
 
+from ....metric import OptimizeResult
 from ..api import VectorDB
-from .config import TiDBIndexConfig
+from .config import SPFreshBuildMode, TiDBIndexConfig
 
 log = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ class TiDB(VectorDB):
 
     def _create_table(self):
         index_sql = ""
-        if self.case_config.build_spfresh_index:
+        if self._should_inline_spfresh_index():
             index_sql = f",\n                        {self._spfresh_index_definition()}"
 
         try:
@@ -108,12 +109,45 @@ class TiDB(VectorDB):
     def ready_to_load(self) -> bool:
         return True
 
-    def optimize(self, data_size: int | None = None) -> None:
+    def optimize(self, data_size: int | None = None) -> OptimizeResult:
         if self.cursor is None or self.conn is None:
             raise RuntimeError("TiDB.optimize() must be called within `with self.init():`")
         if not self.case_config.build_spfresh_index:
             log.info("Skipping TiDB/SPFresh optimize wait because SPFRESH index creation is disabled")
-            return
+            return OptimizeResult()
+
+        if self.case_config.spfresh_build_mode in (SPFreshBuildMode.NON_INLINE, SPFreshBuildMode.SPLIT):
+            return self.build_spfresh_index()
+
+        return self.wait_spfresh_incremental_catchup()
+
+    def build_spfresh_index(self) -> OptimizeResult:
+        if self.cursor is None or self.conn is None:
+            raise RuntimeError("TiDB.build_spfresh_index() must be called within `with self.init():`")
+        if not self.case_config.build_spfresh_index:
+            log.info("Skipping TiDB/SPFresh index build because SPFRESH index creation is disabled")
+            return OptimizeResult()
+
+        log.info(
+            "Building TiDB/SPFresh index: table=%s index=%s",
+            self.table_name,
+            self._spfresh_index_name(),
+        )
+        start = time.perf_counter()
+        self._create_spfresh_index()
+        build_duration = time.perf_counter() - start
+        return OptimizeResult(
+            optimize_duration=build_duration,
+            spfresh_build_duration=build_duration,
+        )
+
+    def wait_spfresh_incremental_catchup(self) -> OptimizeResult:
+        if self.cursor is None or self.conn is None:
+            raise RuntimeError("TiDB.wait_spfresh_incremental_catchup() must be called within `with self.init():`")
+        if not self.case_config.build_spfresh_index:
+            log.info("Skipping TiDB/SPFresh catch-up wait because SPFRESH index creation is disabled")
+            return OptimizeResult()
+
         barrier_ts = self._max_insert_commit_ts
         if barrier_ts is None:
             barrier_ts = self._current_tso_marker()
@@ -125,8 +159,14 @@ class TiDB(VectorDB):
             index_name,
             barrier_ts,
         )
+        start = time.perf_counter()
         self._wait_for_spfresh_ready(barrier_ts=barrier_ts)
+        catchup_duration = time.perf_counter() - start
         self._max_insert_commit_ts = None
+        return OptimizeResult(
+            optimize_duration=catchup_duration,
+            spfresh_incremental_catchup_duration=catchup_duration,
+        )
 
     def export_load_state(self) -> dict[str, int] | None:
         if self._max_insert_commit_ts is None:
@@ -158,9 +198,16 @@ class TiDB(VectorDB):
         )
         return f"idx_embedding_spfresh_{metric_suffix}"
 
+    def _should_inline_spfresh_index(self) -> bool:
+        return self.case_config.build_spfresh_index and self.case_config.spfresh_build_mode == SPFreshBuildMode.INLINE
+
     def _spfresh_index_definition(self) -> str:
         metric_fn = self.case_config.index_param()["metric_fn"]
         return f"VECTOR INDEX {self._spfresh_index_name()} (({metric_fn}(embedding))) USING SPFRESH"
+
+    def _create_spfresh_index(self) -> None:
+        self.cursor.execute(f"ALTER TABLE {self.table_name} ADD {self._spfresh_index_definition()}")
+        self.conn.commit()
 
     def _last_commit_ts(self, cursor: Any) -> int:
         cursor.execute("SELECT json_extract(@@tidb_last_txn_info, '$.commit_ts')")

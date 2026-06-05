@@ -16,7 +16,11 @@ class Metric:
     # for both performace and streaming cases
     insert_duration: float = 0.0
     optimize_duration: float = 0.0
-    load_duration: float = 0.0  # insert + optimize
+    spfresh_build_duration: float = 0.0
+    spfresh_incremental_catchup_duration: float = 0.0
+    spfresh_base_insert_duration: float = 0.0
+    spfresh_delta_insert_duration: float = 0.0
+    load_duration: float = 0.0
     delete_duration: float = 0.0
     delete_search_immediate_result_count: int = 0
     delete_search_immediate_results: list[int] = field(default_factory=list)
@@ -56,8 +60,19 @@ class Metric:
     st_conc_latency_avg_list_list: list[list[float]] = field(default_factory=list)
 
 
+@dataclass
+class OptimizeResult:
+    """Structured timing returned by database-specific optimize hooks."""
+
+    optimize_duration: float = 0.0
+    spfresh_build_duration: float = 0.0
+    spfresh_incremental_catchup_duration: float = 0.0
+
+
 QURIES_PER_DOLLAR_METRIC = "QP$ (Quries per Dollar)"
 LOAD_DURATION_METRIC = "load_duration"
+SPFRESH_BUILD_DURATION_METRIC = "spfresh_build_duration"
+SPFRESH_INCREMENTAL_CATCHUP_DURATION_METRIC = "spfresh_incremental_catchup_duration"
 DELETE_DURATION_METRIC = "delete_duration"
 DELETE_SEARCH_IMMEDIATE_RESULT_COUNT_METRIC = "delete_search_immediate_result_count"
 DELETE_SEARCH_FINAL_RESULT_COUNT_METRIC = "delete_search_final_result_count"
@@ -70,6 +85,8 @@ RECALL_METRIC = "recall"
 
 metric_unit_map = {
     LOAD_DURATION_METRIC: "s",
+    SPFRESH_BUILD_DURATION_METRIC: "s",
+    SPFRESH_INCREMENTAL_CATCHUP_DURATION_METRIC: "s",
     DELETE_DURATION_METRIC: "s",
     DELETE_SEARCH_IMMEDIATE_RESULT_COUNT_METRIC: "",
     DELETE_SEARCH_FINAL_RESULT_COUNT_METRIC: "",
@@ -82,6 +99,8 @@ metric_unit_map = {
 
 lower_is_better_metrics = [
     LOAD_DURATION_METRIC,
+    SPFRESH_BUILD_DURATION_METRIC,
+    SPFRESH_INCREMENTAL_CATCHUP_DURATION_METRIC,
     DELETE_DURATION_METRIC,
     DELETE_SEARCH_SETTLE_DURATION_METRIC,
     SERIAL_LATENCY_P99_METRIC,
@@ -92,6 +111,8 @@ metric_order = [
     QPS_METRIC,
     RECALL_METRIC,
     LOAD_DURATION_METRIC,
+    SPFRESH_BUILD_DURATION_METRIC,
+    SPFRESH_INCREMENTAL_CATCHUP_DURATION_METRIC,
     DELETE_DURATION_METRIC,
     DELETE_SEARCH_IMMEDIATE_RESULT_COUNT_METRIC,
     DELETE_SEARCH_FINAL_RESULT_COUNT_METRIC,

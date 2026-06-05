@@ -89,6 +89,26 @@ class TiDBTypedDict(CommonTypedDict):
             help="Create SPFRESH vector index during TiDB table creation",
         ),
     ]
+    spfresh_build_mode: Annotated[
+        str,
+        click.option(
+            "--spfresh-build-mode",
+            type=click.Choice(["inline", "non-inline", "split"]),
+            default="inline",
+            show_default=True,
+            help="SPFRESH build workflow: inline, non-inline, or split",
+        ),
+    ]
+    spfresh_split_ratio: Annotated[
+        float,
+        click.option(
+            "--spfresh-split-ratio",
+            type=float,
+            default=0.8,
+            show_default=True,
+            help="Fraction of data inserted before SPFRESH build in split mode",
+        ),
+    ]
     delete_commit_interval: Annotated[
         int,
         click.option(
@@ -150,6 +170,8 @@ def TiDB(
         ),
         db_case_config=TiDBIndexConfig(
             build_spfresh_index=parameters["build_spfresh_index"],
+            spfresh_build_mode=parameters["spfresh_build_mode"],
+            spfresh_split_ratio=parameters["spfresh_split_ratio"],
             delete_commit_interval=parameters["delete_commit_interval"],
             delete_timeout=parameters["delete_timeout"],
             delete_search_wait_timeout=parameters["delete_search_wait_timeout"],

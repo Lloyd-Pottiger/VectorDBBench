@@ -10,7 +10,7 @@ import numpy as np
 import psutil
 
 from ..base import BaseModel
-from ..metric import Metric
+from ..metric import Metric, OptimizeResult
 from ..models import PerformanceTimeoutError, TaskConfig, TaskStage
 from . import utils
 from .cases import Case, CaseLabel, StreamingPerformanceCase
@@ -211,67 +211,13 @@ class CaseRunner(BaseModel):
         try:
             m = Metric()
             if drop_old:
-                if TaskStage.LOAD in self.config.stages:
-                    _, load_dur = self._load_train_data()
-                    optimize_dur = self._optimize()
-                    m.insert_duration = round(load_dur, 4)
-                    m.optimize_duration = round(optimize_dur, 4)
-                    m.load_duration = round(load_dur + optimize_dur, 4)
-                    log.info(
-                        f"Finish loading the entire dataset into VectorDB,"
-                        f" insert_duration={load_dur}, optimize_duration={optimize_dur}"
-                        f" load_duration(insert + optimize) = {m.load_duration}"
-                    )
-                else:
-                    log.info("Data loading skipped")
+                self._run_perf_load_stage(m)
             if TaskStage.BUILD in self.config.stages and TaskStage.LOAD not in self.config.stages:
-                build_dur = self._optimize()
-                m.optimize_duration = round(build_dur, 4)
-                log.info(f"Finish building VectorDB index, optimize_duration={build_dur}")
+                self._run_perf_build_only_stage(m)
             if TaskStage.DELETE in self.config.stages:
-                _, delete_dur = self._delete_data()
-                m.delete_duration = round(delete_dur, 4)
-                log.info(f"Finish deleting the entire dataset from VectorDB, delete_duration={delete_dur}")
-                (
-                    immediate_results,
-                    final_results,
-                    settle_duration,
-                    poll_count,
-                    deadline_exceeded,
-                ) = self._verify_search_after_delete()
-                m.delete_search_immediate_results = immediate_results
-                m.delete_search_immediate_result_count = len(immediate_results)
-                m.delete_search_final_results = final_results
-                m.delete_search_final_result_count = len(final_results)
-                m.delete_search_settle_duration = round(settle_duration, 4)
-                m.delete_search_poll_count = poll_count
-                log.info(
-                    "Post-delete ANN search finished, immediate_count=%s, immediate_results=%s, "
-                    "final_count=%s, final_results=%s, settle_duration=%s, polls=%s",
-                    m.delete_search_immediate_result_count,
-                    m.delete_search_immediate_results,
-                    m.delete_search_final_result_count,
-                    m.delete_search_final_results,
-                    m.delete_search_settle_duration,
-                    m.delete_search_poll_count,
-                )
-                if deadline_exceeded:
-                    self._raise_post_delete_verification_error(final_results)
+                self._run_perf_delete_stage(m)
             if TaskStage.SEARCH_SERIAL in self.config.stages or TaskStage.SEARCH_CONCURRENT in self.config.stages:
-                self._init_search_runner()
-                if TaskStage.SEARCH_CONCURRENT in self.config.stages:
-                    search_results = self._conc_search()
-                    (
-                        m.qps,
-                        m.conc_num_list,
-                        m.conc_qps_list,
-                        m.conc_latency_p99_list,
-                        m.conc_latency_p95_list,
-                        m.conc_latency_avg_list,
-                    ) = search_results
-                if TaskStage.SEARCH_SERIAL in self.config.stages:
-                    search_results = self._serial_search()
-                    m.recall, m.ndcg, m.serial_latency_p99, m.serial_latency_p95 = search_results
+                self._run_perf_search_stages(m)
 
         except Exception as e:
             log.warning(f"Failed to run performance case, reason = {e}")
@@ -280,6 +226,98 @@ class CaseRunner(BaseModel):
         else:
             log.info(f"Performance case got result: {m}")
             return m
+
+    def _run_perf_load_stage(self, metric: Metric) -> None:
+        if TaskStage.LOAD not in self.config.stages:
+            log.info("Data loading skipped")
+            return
+
+        if self._is_tidb_spfresh_split_load():
+            self._run_spfresh_split_load(metric)
+            log.info(
+                "Finish SPFRESH split load, insert_duration=%s, "
+                "spfresh_build_duration=%s, spfresh_incremental_catchup_duration=%s, "
+                "load_duration=%s",
+                metric.insert_duration,
+                metric.spfresh_build_duration,
+                metric.spfresh_incremental_catchup_duration,
+                metric.load_duration,
+            )
+        else:
+            self._run_standard_load_stage(metric)
+
+        log.info(
+            f"Finish loading the entire dataset into VectorDB,"
+            f" insert_duration={metric.insert_duration}, optimize_duration={metric.optimize_duration}"
+            f" load_duration(insert + optimize) = {metric.load_duration}"
+        )
+
+    def _run_standard_load_stage(self, metric: Metric) -> None:
+        load_start = time.perf_counter()
+        _, load_dur = self._load_train_data()
+        optimize_result = self._coerce_optimize_result(self._optimize())
+        if self._is_tidb_spfresh_inline_load():
+            incremental_catchup_dur = time.perf_counter() - load_start
+            optimize_result.spfresh_incremental_catchup_duration = incremental_catchup_dur
+            optimize_result.optimize_duration = optimize_result.spfresh_build_duration + incremental_catchup_dur
+            load_duration = optimize_result.optimize_duration
+        else:
+            load_duration = load_dur + optimize_result.optimize_duration
+
+        metric.insert_duration = round(load_dur, 4)
+        self._record_optimize_result(metric, optimize_result)
+        metric.load_duration = round(load_duration, 4)
+
+    def _run_perf_build_only_stage(self, metric: Metric) -> None:
+        build_result = self._optimize()
+        self._record_optimize_result(metric, build_result)
+        log.info(f"Finish building VectorDB index, optimize_duration={metric.optimize_duration}")
+
+    def _run_perf_delete_stage(self, metric: Metric) -> None:
+        _, delete_dur = self._delete_data()
+        metric.delete_duration = round(delete_dur, 4)
+        log.info(f"Finish deleting the entire dataset from VectorDB, delete_duration={delete_dur}")
+        (
+            immediate_results,
+            final_results,
+            settle_duration,
+            poll_count,
+            deadline_exceeded,
+        ) = self._verify_search_after_delete()
+        metric.delete_search_immediate_results = immediate_results
+        metric.delete_search_immediate_result_count = len(immediate_results)
+        metric.delete_search_final_results = final_results
+        metric.delete_search_final_result_count = len(final_results)
+        metric.delete_search_settle_duration = round(settle_duration, 4)
+        metric.delete_search_poll_count = poll_count
+        log.info(
+            "Post-delete ANN search finished, immediate_count=%s, immediate_results=%s, "
+            "final_count=%s, final_results=%s, settle_duration=%s, polls=%s",
+            metric.delete_search_immediate_result_count,
+            metric.delete_search_immediate_results,
+            metric.delete_search_final_result_count,
+            metric.delete_search_final_results,
+            metric.delete_search_settle_duration,
+            metric.delete_search_poll_count,
+        )
+        if deadline_exceeded:
+            self._raise_post_delete_verification_error(final_results)
+
+    def _run_perf_search_stages(self, metric: Metric) -> None:
+        self._init_search_runner()
+        if TaskStage.SEARCH_CONCURRENT in self.config.stages:
+            search_results = self._conc_search()
+            (
+                metric.qps,
+                metric.conc_num_list,
+                metric.conc_qps_list,
+                metric.conc_latency_p99_list,
+                metric.conc_latency_p95_list,
+                metric.conc_latency_avg_list,
+            ) = search_results
+        if TaskStage.SEARCH_SERIAL in self.config.stages:
+            search_results = self._serial_search()
+            metric.recall, metric.ndcg, metric.serial_latency_p99, metric.serial_latency_p95 = search_results
 
     def _run_streaming_case(self) -> Metric:
         log.info("Start streaming case")
@@ -294,8 +332,78 @@ class CaseRunner(BaseModel):
             log.info(f"Streaming case got result: {m}")
             return m
 
+    def _tidb_spfresh_build_mode(self) -> str | None:
+        if getattr(self.config, "db", None) != DB.TiDB:
+            return None
+        db_case_config = getattr(self.config, "db_case_config", None)
+        if not getattr(db_case_config, "build_spfresh_index", False):
+            return None
+        mode = getattr(db_case_config, "spfresh_build_mode", "inline")
+        return getattr(mode, "value", mode)
+
+    def _is_tidb_spfresh_inline_load(self) -> bool:
+        return self._tidb_spfresh_build_mode() == "inline"
+
+    def _is_tidb_spfresh_split_load(self) -> bool:
+        return self._tidb_spfresh_build_mode() == "split"
+
+    def _spfresh_split_counts(self) -> tuple[int, int]:
+        ratio = float(getattr(self.config.db_case_config, "spfresh_split_ratio", 0.8))
+        total = int(self.ca.dataset.data.size)
+        if total < 2:
+            raise ValueError("SPFRESH split load requires at least two rows")
+        base_count = int(total * ratio)
+        base_count = min(max(1, base_count), total - 1)
+        return base_count, total - base_count
+
+    @staticmethod
+    def _coerce_optimize_result(result: OptimizeResult | float | None, wall_duration: float | None = None):
+        if isinstance(result, OptimizeResult):
+            return result
+        if isinstance(result, int | float):
+            return OptimizeResult(optimize_duration=float(result))
+        return OptimizeResult(optimize_duration=0.0 if wall_duration is None else wall_duration)
+
+    def _record_optimize_result(self, metric: Metric, result: OptimizeResult | float | None) -> None:
+        optimize_result = self._coerce_optimize_result(result)
+        metric.optimize_duration = round(optimize_result.optimize_duration, 4)
+        metric.spfresh_build_duration = round(optimize_result.spfresh_build_duration, 4)
+        metric.spfresh_incremental_catchup_duration = round(
+            optimize_result.spfresh_incremental_catchup_duration,
+            4,
+        )
+
+    def _run_spfresh_split_load(self, metric: Metric) -> None:
+        base_count, delta_count = self._spfresh_split_counts()
+
+        _, base_insert_dur = self._load_train_data(limit=base_count)
+        build_result = self._coerce_optimize_result(self._build_spfresh_index())
+
+        delta_start = time.perf_counter()
+        _, delta_insert_dur = self._load_train_data(start_offset=base_count, limit=delta_count)
+        wait_result = self._coerce_optimize_result(self._wait_spfresh_incremental_catchup())
+        incremental_catchup_dur = time.perf_counter() - delta_start
+
+        spfresh_build_dur = build_result.spfresh_build_duration
+        optimize_dur = spfresh_build_dur + incremental_catchup_dur
+
+        metric.spfresh_base_insert_duration = round(base_insert_dur, 4)
+        metric.spfresh_delta_insert_duration = round(delta_insert_dur, 4)
+        metric.insert_duration = round(base_insert_dur + delta_insert_dur, 4)
+        metric.spfresh_build_duration = round(spfresh_build_dur, 4)
+        metric.spfresh_incremental_catchup_duration = round(incremental_catchup_dur, 4)
+        metric.optimize_duration = round(optimize_dur, 4)
+        metric.load_duration = round(base_insert_dur + optimize_dur, 4)
+
+        if wait_result.spfresh_incremental_catchup_duration:
+            log.info(
+                "SPFRESH split post-insert wait duration=%s, end-to-end incremental catch-up duration=%s",
+                wait_result.spfresh_incremental_catchup_duration,
+                incremental_catchup_dur,
+            )
+
     @utils.time_it
-    def _load_train_data(self):
+    def _load_train_data(self, start_offset: int = 0, limit: int | None = None):
         """Insert train data and get the insert_duration"""
         try:
             runner = SerialInsertRunner(
@@ -304,13 +412,16 @@ class CaseRunner(BaseModel):
                 self.normalize,
                 self.ca.filters,
                 self.ca.load_timeout,
+                start_offset=start_offset,
+                limit=limit,
             )
             count, load_state = runner.run()
+        except Exception as e:
+            raise e from None
+        else:
             if hasattr(self.db, "import_load_state"):
                 self.db.import_load_state(load_state)
             return count
-        except Exception as e:
-            raise e from None
         finally:
             runner = None
 
@@ -327,11 +438,12 @@ class CaseRunner(BaseModel):
                 delete_timeout,
             )
             count, delete_state = runner.run()
+        except Exception as e:
+            raise e from None
+        else:
             if hasattr(self.db, "import_delete_state"):
                 self.db.import_delete_state(delete_state)
             return count
-        except Exception as e:
-            raise e from None
         finally:
             runner = None
 
@@ -356,7 +468,7 @@ class CaseRunner(BaseModel):
 
     @staticmethod
     def _raise_post_delete_verification_error(final_results: list[int]) -> None:
-        msg = "Post-delete ANN verification did not become empty before the deadline, " f"final_results={final_results}"
+        msg = f"Post-delete ANN verification did not become empty before the deadline, final_results={final_results}"
         raise RuntimeError(msg)
 
     def _wait_post_delete_ann_ready(self, wait_timeout: float, poll_interval: float) -> None:
@@ -374,8 +486,7 @@ class CaseRunner(BaseModel):
 
         if barrier_ts is not None:
             log.info(
-                "SPFRESH incremental apply caught up before post-delete ANN search, "
-                "delete_commit_barrier_ts=%s",
+                "SPFRESH incremental apply caught up before post-delete ANN search, delete_commit_barrier_ts=%s",
                 barrier_ts,
             )
 
@@ -433,23 +544,36 @@ class CaseRunner(BaseModel):
             self.stop()
 
     @utils.time_it
-    def _optimize_task(self) -> None:
+    def _db_method_task(self, method_name: str) -> OptimizeResult | None:
         with self.db.init():
-            self.db.optimize(data_size=self.ca.dataset.data.size)
+            method = getattr(self.db, method_name)
+            if method_name == "optimize":
+                return method(data_size=self.ca.dataset.data.size)
+            return method()
 
-    def _optimize(self) -> float:
+    def _run_db_method(self, method_name: str) -> OptimizeResult:
         with concurrent.futures.ProcessPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(self._optimize_task)
+            future = executor.submit(self._db_method_task, method_name)
             try:
-                return future.result(timeout=self.ca.optimize_timeout)[1]
+                raw_result, wall_duration = future.result(timeout=self.ca.optimize_timeout)
+                return self._coerce_optimize_result(raw_result, wall_duration)
             except TimeoutError as e:
-                log.warning(f"VectorDB optimize timeout in {self.ca.optimize_timeout}")
+                log.warning(f"VectorDB {method_name} timeout in {self.ca.optimize_timeout}")
                 for pid, _ in executor._processes.items():
                     psutil.Process(pid).kill()
                 raise PerformanceTimeoutError from e
             except Exception as e:
-                log.warning(f"VectorDB optimize error: {e}")
+                log.warning(f"VectorDB {method_name} error: {e}")
                 raise e from None
+
+    def _optimize(self) -> OptimizeResult:
+        return self._run_db_method("optimize")
+
+    def _build_spfresh_index(self) -> OptimizeResult:
+        return self._run_db_method("build_spfresh_index")
+
+    def _wait_spfresh_incremental_catchup(self) -> OptimizeResult:
+        return self._run_db_method("wait_spfresh_incremental_catchup")
 
     def _init_search_runner(self):
         if self.normalize:

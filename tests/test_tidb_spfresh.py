@@ -1,7 +1,9 @@
+from contextlib import contextmanager
 from types import SimpleNamespace, TracebackType
 from typing import Any
 from unittest.mock import patch
 
+import pandas as pd
 import pytest
 
 from vectordb_bench.backend.clients.api import MetricType
@@ -11,6 +13,7 @@ from vectordb_bench.backend.clients.tidb.tidb import (
     SPFreshIndexStatus,
     TiDB,
 )
+from vectordb_bench.backend.runner import SerialInsertRunner
 from vectordb_bench.backend.task_runner import CaseRunner
 
 
@@ -36,6 +39,38 @@ class FakeConnection:
         self.committed = True
 
 
+class FakeInsertDB:
+    def __init__(self):
+        self.inserted_metadata: list[int] = []
+
+    @contextmanager
+    def init(self):
+        yield
+
+    def insert_embeddings(
+        self,
+        embeddings: list[list[float]],
+        metadata: list[int],
+        labels_data: list[str] | None = None,
+    ) -> tuple[int, None]:
+        self.inserted_metadata.extend(metadata)
+        return len(metadata), None
+
+
+class FakeDataset:
+    def __init__(self):
+        self.data = SimpleNamespace(train_id_field="id", train_vector_field="emb", scalar_labels_file_separated=True)
+        self.scalar_labels = None
+
+    def __iter__(self):
+        return iter(
+            [
+                pd.DataFrame({"id": list(range(5)), "emb": [[float(i)] for i in range(5)]}),
+                pd.DataFrame({"id": list(range(5, 10)), "emb": [[float(i)] for i in range(5, 10)]}),
+            ]
+        )
+
+
 def make_tidb(dim: int = 3) -> TiDB:
     return TiDB(
         dim=dim,
@@ -53,6 +88,22 @@ def make_tidb(dim: int = 3) -> TiDB:
 
 
 class TestTiDBSPFresh:
+    def test_serial_insert_runner_loads_requested_row_range(self):
+        db = FakeInsertDB()
+        runner = SerialInsertRunner(
+            db=db,
+            dataset=FakeDataset(),
+            normalize=False,
+            start_offset=3,
+            limit=4,
+        )
+
+        count, load_state = runner.task()
+
+        assert count == 4
+        assert load_state is None
+        assert db.inserted_metadata == [3, 4, 5, 6]
+
     def test_insert_embeddings_keeps_existing_worker_sharding_when_batches_are_small(self):
         tidb = make_tidb()
         embeddings = [[] for _ in range(200)]
@@ -205,6 +256,75 @@ class TestTiDBSPFresh:
         sql, _ = cursor.execute_calls[0]
         assert "CREATE TABLE vector_bench_test" in sql
         assert "VECTOR INDEX idx_embedding_spfresh_l2 ((vec_l2_distance(embedding))) USING SPFRESH" in sql
+
+    def test_create_table_skips_inline_index_for_non_inline_spfresh_mode(self):
+        tidb = TiDB(
+            dim=3,
+            db_config={
+                "host": "127.0.0.1",
+                "port": 4000,
+                "user": "root",
+                "password": "",
+                "database": "test",
+                "ssl_verify_cert": False,
+                "ssl_verify_identity": False,
+            },
+            db_case_config=TiDBIndexConfig(
+                metric_type=MetricType.L2,
+                spfresh_build_mode="non-inline",
+            ),
+        )
+        cursor = FakeCursor()
+        conn = FakeConnection()
+
+        class ConnectionContext:
+            def __enter__(self_inner) -> tuple[FakeConnection, FakeCursor]:
+                return conn, cursor
+
+            def __exit__(
+                self_inner,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+        with patch.object(tidb, "_get_connection", return_value=ConnectionContext()):
+            tidb._create_table()
+
+        sql, _ = cursor.execute_calls[0]
+        assert "CREATE TABLE vector_bench_test" in sql
+        assert "VECTOR INDEX" not in sql
+
+    def test_build_spfresh_index_records_alter_table_duration(self):
+        tidb = TiDB(
+            dim=3,
+            db_config={
+                "host": "127.0.0.1",
+                "port": 4000,
+                "user": "root",
+                "password": "",
+                "database": "test",
+                "ssl_verify_cert": False,
+                "ssl_verify_identity": False,
+            },
+            db_case_config=TiDBIndexConfig(
+                metric_type=MetricType.L2,
+                spfresh_build_mode="non-inline",
+            ),
+        )
+        tidb.cursor = FakeCursor()
+        tidb.conn = FakeConnection()
+
+        with patch("vectordb_bench.backend.clients.tidb.tidb.time.perf_counter", side_effect=[10.0, 13.5]):
+            result = tidb.build_spfresh_index()
+
+        sql, _ = tidb.cursor.execute_calls[0]
+        assert "ALTER TABLE vector_bench_test ADD VECTOR INDEX idx_embedding_spfresh_l2" in sql
+        assert result.optimize_duration == 3.5
+        assert result.spfresh_build_duration == 3.5
+        assert result.spfresh_incremental_catchup_duration == 0.0
+        assert tidb.conn.committed is True
 
     def test_optimize_waits_for_recorded_insert_barrier(self):
         tidb = make_tidb()

@@ -31,12 +31,21 @@ class SerialInsertRunner:
         normalize: bool,
         filters: Filter = non_filter,
         timeout: float | None = None,
+        start_offset: int = 0,
+        limit: int | None = None,
     ):
         self.timeout = timeout if isinstance(timeout, int | float) else None
         self.dataset = dataset
         self.db = db
         self.normalize = normalize
         self.filters = filters
+        self.start_offset = start_offset
+        self.limit = limit
+
+        if self.start_offset < 0:
+            raise ValueError("start_offset must be >= 0")
+        if self.limit is not None and self.limit < 0:
+            raise ValueError("limit must be >= 0")
 
     def retry_insert(self, db: api.VectorDB, retry_idx: int = 0, **kwargs):
         _, error = db.insert_embeddings(**kwargs)
@@ -52,13 +61,33 @@ class SerialInsertRunner:
 
     def task(self) -> tuple[int, dict | None]:
         count = 0
+        seen = 0
         with self.db.init():
             log.info(f"({mp.current_process().name:16}) Start inserting embeddings in batch {config.NUM_PER_BATCH}")
             start = time.perf_counter()
             for data_df in self.dataset:
-                all_metadata = data_df[self.dataset.data.train_id_field].tolist()
+                batch_len = len(data_df)
+                batch_end = seen + batch_len
+                if batch_end <= self.start_offset:
+                    seen = batch_end
+                    continue
+                if self.limit is not None and count >= self.limit:
+                    break
 
-                emb_np = np.stack(data_df[self.dataset.data.train_vector_field])
+                slice_start = max(0, self.start_offset - seen)
+                slice_len = batch_len - slice_start
+                if self.limit is not None:
+                    slice_len = min(slice_len, self.limit - count)
+                if slice_len <= 0:
+                    seen = batch_end
+                    continue
+                batch_df = data_df
+                if slice_start > 0 or slice_len < batch_len:
+                    batch_df = data_df.iloc[slice_start : slice_start + slice_len]
+
+                all_metadata = batch_df[self.dataset.data.train_id_field].tolist()
+
+                emb_np = np.stack(batch_df[self.dataset.data.train_vector_field])
                 if self.normalize:
                     log.debug("normalize the 100k train data")
                     all_embeddings = (emb_np / np.linalg.norm(emb_np, axis=1)[:, np.newaxis]).tolist()
@@ -72,7 +101,7 @@ class SerialInsertRunner:
                     if self.dataset.data.scalar_labels_file_separated:
                         labels_data = self.dataset.scalar_labels[self.filters.label_field][all_metadata].to_list()
                     else:
-                        labels_data = data_df[self.filters.label_field].tolist()
+                        labels_data = batch_df[self.filters.label_field].tolist()
 
                 insert_count, error = self.db.insert_embeddings(
                     embeddings=all_embeddings,
@@ -91,6 +120,7 @@ class SerialInsertRunner:
                 count += insert_count
                 if count % 100_000 == 0:
                     log.info(f"({mp.current_process().name:16}) Loaded {count} embeddings into VectorDB")
+                seen = batch_end
 
             log.info(
                 f"({mp.current_process().name:16}) Finish loading all dataset into VectorDB, "
@@ -209,6 +239,70 @@ class SerialInsertRunner:
     def run(self) -> tuple[int, dict | None]:
         (count, load_state), _ = self._insert_all_batches()
         return count, load_state
+
+
+class SerialDeleteRunner:
+    def __init__(
+        self,
+        db: api.VectorDB,
+        dataset: DatasetManager,
+        timeout: float | None = None,
+    ):
+        self.timeout = timeout if isinstance(timeout, int | float) else None
+        self.dataset = dataset
+        self.db = db
+
+    def task(self) -> tuple[int, dict | None]:
+        count = 0
+        with self.db.init():
+            log.info(f"({mp.current_process().name:16}) Start deleting embeddings from VectorDB")
+            start = time.perf_counter()
+            for data_df in self.dataset:
+                batch_ids = data_df[self.dataset.data.train_id_field].tolist()
+                delete_count, error = self.db.delete_embeddings(ids=batch_ids)
+                if error is not None:
+                    msg = f"Delete failed with explicit error return: {error}"
+                    raise RuntimeError(msg) from error
+                if delete_count != len(batch_ids):
+                    msg = f"Delete count mismatch, expected={len(batch_ids)}, actual={delete_count}"
+                    raise RuntimeError(msg)
+
+                count += delete_count
+                if count % 100_000 == 0:
+                    log.info(f"({mp.current_process().name:16}) Deleted {count} embeddings from VectorDB")
+
+            log.info(
+                f"({mp.current_process().name:16}) Finish deleting the dataset from VectorDB, "
+                f"dur={time.perf_counter() - start}"
+            )
+            if hasattr(self.db, "export_delete_state"):
+                return count, self.db.export_delete_state()
+            return count, None
+
+    @utils.time_it
+    def _delete_all_batches(self) -> tuple[int, dict | None]:
+        with concurrent.futures.ProcessPoolExecutor(
+            mp_context=mp.get_context("spawn"),
+            max_workers=1,
+        ) as executor:
+            future = executor.submit(self.task)
+            try:
+                count = future.result(timeout=self.timeout)
+            except TimeoutError as e:
+                msg = f"VectorDB delete dataset timeout in {self.timeout}"
+                log.warning(msg)
+                for pid, _ in executor._processes.items():
+                    psutil.Process(pid).kill()
+                raise PerformanceTimeoutError(msg) from e
+            except Exception as e:
+                log.warning(f"VectorDB delete dataset error: {e}")
+                raise e from e
+            else:
+                return count
+
+    def run(self) -> tuple[int, dict | None]:
+        (count, delete_state), _ = self._delete_all_batches()
+        return count, delete_state
 
 
 class SerialSearchRunner:

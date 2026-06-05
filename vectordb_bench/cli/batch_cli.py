@@ -51,9 +51,12 @@ def build_sub_cmd_args(batch_config: MutableMapping[str, Any] | None):
     bool_options = {
         "drop_old": True,
         "load": True,
+        "build": False,
+        "delete": False,
         "search_serial": True,
         "search_concurrent": True,
         "dry_run": False,
+        "build_spfresh_index": True,
         "custom_dataset_use_shuffled": True,
         "custom_dataset_with_gt": True,
     }

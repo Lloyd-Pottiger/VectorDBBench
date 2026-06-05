@@ -132,16 +132,26 @@ def parse_task_stages(
     load: bool,
     search_serial: bool,
     search_concurrent: bool,
+    delete: bool = False,
+    build: bool = False,
 ) -> list[TaskStage]:
     stages = []
     if load and not drop_old:
         raise RuntimeError("Dropping old data cannot be skipped if loading data")
     if drop_old and not load:
         raise RuntimeError("Load cannot be skipped if dropping old data")
+    if build and load:
+        raise RuntimeError("Build-only cannot be combined with loading data; load already builds/optimizes data")
+    if delete and (search_serial or search_concurrent):
+        raise RuntimeError("Delete benchmark cannot be combined with search stages")
     if drop_old:
         stages.append(TaskStage.DROP_OLD)
     if load:
         stages.append(TaskStage.LOAD)
+    if build:
+        stages.append(TaskStage.BUILD)
+    if delete:
+        stages.append(TaskStage.DELETE)
     if search_serial:
         stages.append(TaskStage.SEARCH_SERIAL)
     if search_concurrent:
@@ -228,6 +238,16 @@ class CommonTypedDict(TypedDict):
             type=bool,
             default=True,
             help="Load or skip",
+            show_default=True,
+        ),
+    ]
+    build: Annotated[
+        bool,
+        click.option(
+            "--build/--skip-build",
+            type=bool,
+            default=False,
+            help="Wait for vector index catch-up without loading data",
             show_default=True,
         ),
     ]
@@ -642,6 +662,8 @@ def run(
             parameters["load"],
             parameters["search_serial"],
             parameters["search_concurrent"],
+            parameters.get("delete", False),
+            build=parameters["build"],
         ),
     )
     task_label = parameters["task_label"]

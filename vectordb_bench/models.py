@@ -5,6 +5,7 @@ from enum import Enum, StrEnum
 from typing import Self
 
 import ujson
+from pydantic import Field, validator
 
 from vectordb_bench.backend.cases import type2case
 from vectordb_bench.backend.dataset import DatasetWithSizeMap
@@ -199,6 +200,8 @@ class TaskStage(StrEnum):
 
     DROP_OLD = "drop_old"
     LOAD = "load"
+    BUILD = "build"
+    DELETE = "delete"
     SEARCH_SERIAL = "search_serial"
     SEARCH_CONCURRENT = "search_concurrent"
 
@@ -206,8 +209,17 @@ class TaskStage(StrEnum):
         return str.__repr__(self.value)
 
 
-# TODO: Add CapacityCase enums and adjust TaskRunner to utilize
+# Keep DELETE opt-in so existing tasks do not start deleting data by default.
 ALL_TASK_STAGES = [
+    TaskStage.DROP_OLD,
+    TaskStage.LOAD,
+    TaskStage.BUILD,
+    TaskStage.DELETE,
+    TaskStage.SEARCH_SERIAL,
+    TaskStage.SEARCH_CONCURRENT,
+]
+
+DEFAULT_TASK_STAGES = [
     TaskStage.DROP_OLD,
     TaskStage.LOAD,
     TaskStage.SEARCH_SERIAL,
@@ -220,7 +232,13 @@ class TaskConfig(BaseModel):
     db_config: DBConfig
     db_case_config: DBCaseConfig
     case_config: CaseConfig
-    stages: list[TaskStage] = ALL_TASK_STAGES
+    stages: list[TaskStage] = Field(default_factory=lambda: DEFAULT_TASK_STAGES.copy())
+
+    @validator("stages")
+    def validate_stages(cls, stages: list[TaskStage]):
+        if TaskStage.DELETE in stages and (TaskStage.SEARCH_SERIAL in stages or TaskStage.SEARCH_CONCURRENT in stages):
+            raise ValueError("Delete benchmark cannot be combined with search stages")
+        return stages
 
     @property
     def db_name(self):
@@ -395,11 +413,29 @@ class TestResult(BaseModel):
         max_db_labels = max(map(len, [f.task_config.db_config.db_label for f in filtered_results])) + 3
         max_case = max(map(len, [f.task_config.case_config.case_name for f in filtered_results]))
         max_load_dur = max(map(len, [str(f.metrics.load_duration) for f in filtered_results])) + 3
+        max_spfresh_build = max(map(len, [str(f.metrics.spfresh_build_duration) for f in filtered_results])) + 3
+        max_spfresh_catchup = (
+            max(map(len, [str(f.metrics.spfresh_incremental_catchup_duration) for f in filtered_results])) + 3
+        )
+        max_delete_dur = max(map(len, [str(f.metrics.delete_duration) for f in filtered_results])) + 3
+        max_delete_qry_now = (
+            max(map(len, [str(f.metrics.delete_search_immediate_result_count) for f in filtered_results])) + 3
+        )
+        max_delete_qry_final = (
+            max(map(len, [str(f.metrics.delete_search_final_result_count) for f in filtered_results])) + 3
+        )
+        max_delete_settle = max(map(len, [str(f.metrics.delete_search_settle_duration) for f in filtered_results])) + 3
         max_qps = max(map(len, [str(f.metrics.qps) for f in filtered_results])) + 3
         max_recall = max(map(len, [str(f.metrics.recall) for f in filtered_results])) + 3
 
         max_db_labels = 8 if max_db_labels < 8 else max_db_labels
         max_load_dur = 11 if max_load_dur < 11 else max_load_dur
+        max_spfresh_build = 13 if max_spfresh_build < 13 else max_spfresh_build
+        max_spfresh_catchup = 15 if max_spfresh_catchup < 15 else max_spfresh_catchup
+        max_delete_dur = 11 if max_delete_dur < 11 else max_delete_dur
+        max_delete_qry_now = 11 if max_delete_qry_now < 11 else max_delete_qry_now
+        max_delete_qry_final = 11 if max_delete_qry_final < 11 else max_delete_qry_final
+        max_delete_settle = 11 if max_delete_settle < 11 else max_delete_settle
         max_qps = 10 if max_qps < 10 else max_qps
         max_recall = 13 if max_recall < 13 else max_recall
 
@@ -409,6 +445,12 @@ class TestResult(BaseModel):
             max_case,
             len(self.task_label),
             max_load_dur,
+            max_spfresh_build,
+            max_spfresh_catchup,
+            max_delete_dur,
+            max_delete_qry_now,
+            max_delete_qry_final,
+            max_delete_settle,
             max_qps,
             15,
             15,
@@ -419,7 +461,10 @@ class TestResult(BaseModel):
 
         DATA_FORMAT = (  # noqa: N806
             f"%-{max_db}s | %-{max_db_labels}s %-{max_case}s %-{len(self.task_label)}s"
-            f" | %-{max_load_dur}s %-{max_qps}s %-15s %-15s %-{max_recall}s %-14s"
+            f" | %-{max_load_dur}s %-{max_spfresh_build}s %-{max_spfresh_catchup}s"
+            f" %-{max_delete_dur}s %-{max_delete_qry_now}s %-{max_delete_qry_final}s"
+            f" %-{max_delete_settle}s"
+            f" %-{max_qps}s %-15s %-15s %-{max_recall}s %-14s"
             f" | %-5s"
         )
 
@@ -429,6 +474,12 @@ class TestResult(BaseModel):
             "case",
             "label",
             "load_dur",
+            "spfresh_build",
+            "spfresh_catchup",
+            "delete_dur",
+            "delete_now",
+            "delete_final",
+            "delete_wait",
             "qps",
             "latency(p99)",
             "latency(p95)",
@@ -452,6 +503,12 @@ class TestResult(BaseModel):
                     f.task_config.case_config.case_name,
                     self.task_label,
                     f.metrics.load_duration,
+                    f.metrics.spfresh_build_duration,
+                    f.metrics.spfresh_incremental_catchup_duration,
+                    f.metrics.delete_duration,
+                    f.metrics.delete_search_immediate_result_count,
+                    f.metrics.delete_search_final_result_count,
+                    f.metrics.delete_search_settle_duration,
                     f.metrics.qps,
                     f.metrics.serial_latency_p99,
                     f.metrics.serial_latency_p95,

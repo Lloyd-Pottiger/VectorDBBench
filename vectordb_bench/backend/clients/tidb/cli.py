@@ -109,6 +109,18 @@ class TiDBTypedDict(CommonTypedDict):
             help="Fraction of data inserted before SPFRESH build in split mode",
         ),
     ]
+    spfresh_vector_index_param: Annotated[
+        str | None,
+        click.option(
+            "--spfresh-vector-index-param",
+            type=str,
+            default=None,
+            help=(
+                "Raw TiDB VECTOR_INDEX_PARAM value for SPFRESH index creation, "
+                "for example max_partition_size=256,write_beam_size=8"
+            ),
+        ),
+    ]
     delete_commit_interval: Annotated[
         int,
         click.option(
@@ -172,6 +184,7 @@ def TiDB(
             build_spfresh_index=parameters["build_spfresh_index"],
             spfresh_build_mode=parameters["spfresh_build_mode"],
             spfresh_split_ratio=parameters["spfresh_split_ratio"],
+            spfresh_vector_index_param=parameters["spfresh_vector_index_param"],
             delete_commit_interval=parameters["delete_commit_interval"],
             delete_timeout=parameters["delete_timeout"],
             delete_search_wait_timeout=parameters["delete_search_wait_timeout"],

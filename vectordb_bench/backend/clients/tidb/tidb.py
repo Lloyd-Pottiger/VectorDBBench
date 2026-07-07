@@ -204,7 +204,17 @@ class TiDB(VectorDB):
 
     def _spfresh_index_definition(self) -> str:
         metric_fn = self.case_config.index_param()["metric_fn"]
-        return f"VECTOR INDEX {self._spfresh_index_name()} (({metric_fn}(embedding))) USING SPFRESH"
+        return (
+            f"VECTOR INDEX {self._spfresh_index_name()} (({metric_fn}(embedding))) USING SPFRESH"
+            f"{self._spfresh_vector_index_param_clause()}"
+        )
+
+    def _spfresh_vector_index_param_clause(self) -> str:
+        param = self.case_config.spfresh_vector_index_param
+        if not param:
+            return ""
+        escaped = param.replace("'", "''")
+        return f" VECTOR_INDEX_PARAM '{escaped}'"
 
     def _create_spfresh_index(self) -> None:
         self.cursor.execute(f"ALTER TABLE {self.table_name} ADD {self._spfresh_index_definition()}")

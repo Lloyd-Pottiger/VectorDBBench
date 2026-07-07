@@ -257,6 +257,47 @@ class TestTiDBSPFresh:
         assert "CREATE TABLE vector_bench_test" in sql
         assert "VECTOR INDEX idx_embedding_spfresh_l2 ((vec_l2_distance(embedding))) USING SPFRESH" in sql
 
+    def test_create_table_inlines_spfresh_vector_index_param(self):
+        tidb = TiDB(
+            dim=3,
+            db_config={
+                "host": "127.0.0.1",
+                "port": 4000,
+                "user": "root",
+                "password": "",
+                "database": "test",
+                "ssl_verify_cert": False,
+                "ssl_verify_identity": False,
+            },
+            db_case_config=TiDBIndexConfig(
+                metric_type=MetricType.L2,
+                spfresh_vector_index_param="max_partition_size=256,write_beam_size=8",
+            ),
+        )
+        cursor = FakeCursor()
+        conn = FakeConnection()
+
+        class ConnectionContext:
+            def __enter__(self_inner) -> tuple[FakeConnection, FakeCursor]:
+                return conn, cursor
+
+            def __exit__(
+                self_inner,
+                exc_type: type[BaseException] | None,
+                exc: BaseException | None,
+                tb: TracebackType | None,
+            ) -> bool:
+                return False
+
+        with patch.object(tidb, "_get_connection", return_value=ConnectionContext()):
+            tidb._create_table()
+
+        sql, _ = cursor.execute_calls[0]
+        assert (
+            "VECTOR INDEX idx_embedding_spfresh_l2 ((vec_l2_distance(embedding))) USING SPFRESH "
+            "VECTOR_INDEX_PARAM 'max_partition_size=256,write_beam_size=8'"
+        ) in sql
+
     def test_create_table_skips_inline_index_for_non_inline_spfresh_mode(self):
         tidb = TiDB(
             dim=3,
@@ -311,6 +352,7 @@ class TestTiDBSPFresh:
             db_case_config=TiDBIndexConfig(
                 metric_type=MetricType.L2,
                 spfresh_build_mode="non-inline",
+                spfresh_vector_index_param="min_partition_size=32,max_partition_size=256,write_beam_size=8",
             ),
         )
         tidb.cursor = FakeCursor()
@@ -321,10 +363,30 @@ class TestTiDBSPFresh:
 
         sql, _ = tidb.cursor.execute_calls[0]
         assert "ALTER TABLE vector_bench_test ADD VECTOR INDEX idx_embedding_spfresh_l2" in sql
+        assert "VECTOR_INDEX_PARAM 'min_partition_size=32,max_partition_size=256,write_beam_size=8'" in sql
         assert result.optimize_duration == 3.5
         assert result.spfresh_build_duration == 3.5
         assert result.spfresh_incremental_catchup_duration == 0.0
         assert tidb.conn.committed is True
+
+    def test_spfresh_vector_index_param_empty_string_is_ignored(self):
+        cfg = TiDBIndexConfig(metric_type=MetricType.L2, spfresh_vector_index_param=" ")
+        tidb = TiDB(
+            dim=3,
+            db_config={
+                "host": "127.0.0.1",
+                "port": 4000,
+                "user": "root",
+                "password": "",
+                "database": "test",
+                "ssl_verify_cert": False,
+                "ssl_verify_identity": False,
+            },
+            db_case_config=cfg,
+        )
+
+        assert cfg.spfresh_vector_index_param is None
+        assert "VECTOR_INDEX_PARAM" not in tidb._spfresh_index_definition()
 
     def test_optimize_waits_for_recorded_insert_barrier(self):
         tidb = make_tidb()

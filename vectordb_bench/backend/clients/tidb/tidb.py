@@ -1,6 +1,7 @@
 import concurrent.futures
 import io
 import logging
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -14,7 +15,7 @@ from .config import SPFreshBuildMode, TiDBIndexConfig
 
 log = logging.getLogger(__name__)
 
-SPFRESH_OPTIMIZE_TIMEOUT_SECONDS = 600.0
+SPFRESH_OPTIMIZE_TIMEOUT_SECONDS = float(os.environ.get("SPFRESH_OPTIMIZE_TIMEOUT_SECONDS", "600.0"))
 SPFRESH_REGISTRATION_TIMEOUT_SECONDS = 30.0
 SPFRESH_POLL_INTERVAL_SECONDS = 1.0
 SPFRESH_INDEX_STATE_NEEDS_REBUILD = "NEEDS_REBUILD"

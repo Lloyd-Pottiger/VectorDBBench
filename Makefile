@@ -28,6 +28,18 @@ build:
 search-1m-local:
 	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh --case-type Performance768D1M --skip-load --skip-drop-old
 
+load-search-10m-local:
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test10m --task-label tidb-spfresh-10m --case-type Performance768D10M
+
+load-search-10m-non-inline-local:
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test10m --task-label tidb-spfresh-10m-non-inline --case-type Performance768D10M --spfresh-build-mode non-inline $(ARGS)
+
+load-search-10m-split-local:
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test10m --task-label tidb-spfresh-10m-split --case-type Performance768D10M --spfresh-build-mode split --spfresh-split-ratio 0.8 $(ARGS)
+
+search-10m-local:
+	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test10m --task-label tidb-spfresh-10m --case-type Performance768D10M --skip-load --skip-drop-old
+
 delete-plain-1m-local:
 	$(VECTORDBBENCH) tidb --host 127.0.0.1 --port 4000 --username root --password '' --db-name test --task-label tidb-spfresh-delete-plain --case-type Performance768D1M --delete --skip-search-serial --skip-search-concurrent --skip-build-spfresh-index
 

@@ -58,6 +58,7 @@ class TiDBIndexConfig(BaseModel, DBCaseConfig):
     build_spfresh_index: bool = True
     spfresh_build_mode: SPFreshBuildMode = SPFreshBuildMode.INLINE
     spfresh_split_ratio: float = 0.8
+    spfresh_vector_index_param: str | None = None
     delete_commit_interval: int = 1000
     delete_timeout: float | None = None
     delete_search_wait_timeout: float = 30.0
@@ -74,6 +75,13 @@ class TiDBIndexConfig(BaseModel, DBCaseConfig):
         if v <= 0 or v >= 1:
             raise ValueError("spfresh_split_ratio must be > 0 and < 1")
         return v
+
+    @validator("spfresh_vector_index_param")
+    def normalize_spfresh_vector_index_param(cls, v: str | None):
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
     @validator("delete_timeout", "delete_search_wait_timeout", "delete_search_poll_interval")
     def validate_positive_delete_search_window(cls, v: float, field: Any):
@@ -97,6 +105,7 @@ class TiDBIndexConfig(BaseModel, DBCaseConfig):
             "build_spfresh_index": self.build_spfresh_index,
             "spfresh_build_mode": self.spfresh_build_mode.value,
             "spfresh_split_ratio": self.spfresh_split_ratio,
+            "spfresh_vector_index_param": self.spfresh_vector_index_param,
             "metric_fn": self.get_metric_fn(),
         }
 

@@ -22,6 +22,7 @@ class DB(Enum):
         "Milvus"
     """
 
+    KTANN = "KTANN"
     Milvus = "Milvus"
     ZillizCloud = "ZillizCloud"
     Pinecone = "Pinecone"
@@ -70,6 +71,11 @@ class DB(Enum):
     @property
     def init_cls(self) -> type[VectorDB]:  # noqa: PLR0911, PLR0912, C901, PLR0915
         """Import while in use"""
+        if self == DB.KTANN:
+            from .ktann.ktann import KTANN
+
+            return KTANN
+
         if self == DB.Milvus:
             from .milvus.milvus import Milvus
 
@@ -293,6 +299,11 @@ class DB(Enum):
     @property
     def config_cls(self) -> type[DBConfig]:  # noqa: PLR0911, PLR0912, C901, PLR0915
         """Import while in use"""
+        if self == DB.KTANN:
+            from .ktann.config import KTANNConfig
+
+            return KTANNConfig
+
         if self == DB.Milvus:
             from .milvus.config import MilvusConfig
 
@@ -517,6 +528,11 @@ class DB(Enum):
         self,
         index_type: IndexType | None = None,
     ) -> type[DBCaseConfig]:
+        if self == DB.KTANN:
+            from .ktann.config import KTANNCaseConfig
+
+            return KTANNCaseConfig
+
         if self == DB.Milvus:
             from .milvus.config import _milvus_case_config
 

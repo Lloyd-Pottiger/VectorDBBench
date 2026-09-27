@@ -3,8 +3,8 @@
 The adapter connects to a separately launched KTANN bridge over a Unix socket.
 One bridge owns the Runtime and backend across VectorDBBench worker processes.
 It supports full-load, unfiltered, single-tenant, IDs-only L2 and cosine cases.
-Search options inherit KTANN defaults; `--leaf-beam` and `--leaf-budget` override
-search settings explicitly.
+Search options inherit KTANN defaults; `--leaf-beam` overrides the traversal
+beam. Leaf Entry scans have no independent entry budget.
 
 ## Run
 

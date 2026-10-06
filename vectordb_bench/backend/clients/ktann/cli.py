@@ -18,8 +18,8 @@ class KTANNTypedDict(CommonTypedDict):
 @cli.command()
 @click_parameter_decorators_from_typed_dict(KTANNTypedDict)
 def KTANN(**parameters: Unpack[KTANNTypedDict]):
-    if parameters["case_type"] not in {"Performance768D1M", "PerformanceCustomDataset"}:
-        raise click.UsageError("KTANN bridge supports Cohere 1M and unfiltered custom ANN performance cases only")
+    if parameters["case_type"] not in {"Performance768D1M", "Performance768D1M1P", "Performance768D1M99P", "PerformanceCustomDataset"}:
+        raise click.UsageError("KTANN bridge supports Cohere 1M (including numeric filters) and custom ANN performance cases only")
     from .config import KTANNCaseConfig, KTANNConfig
 
     run(

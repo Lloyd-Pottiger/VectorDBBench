@@ -2,7 +2,9 @@
 
 The adapter connects to a separately launched KTANN bridge over a Unix socket.
 One bridge owns the Runtime and backend across VectorDBBench worker processes.
-It supports full-load, unfiltered, single-tenant, IDs-only L2 and cosine cases.
+It supports full-load, single-tenant, IDs-only L2 and cosine cases, including
+Cohere 1M numeric `id >= threshold` filters. `Performance768D1M1P` excludes 1%
+of IDs; `Performance768D1M99P` excludes 99%. Label filters are unsupported.
 Search options inherit KTANN defaults; `--leaf-beam` overrides the traversal
 beam. Leaf Entry scans have no independent entry budget.
 

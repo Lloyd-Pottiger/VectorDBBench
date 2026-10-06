@@ -124,6 +124,23 @@ class BridgeTests(unittest.TestCase):
         queue.join_thread()
         return results
 
+    def test_numeric_filter_boundaries_and_reset(self):
+        from vectordb_bench.backend.filter import IntFilter, non_filter
+
+        client = self.client()
+        with client.init():
+            ids = [-5, 0, 5, 10]
+            count, error = client.insert_embeddings([[float(i), 1., 2., 3.] for i in ids], ids)
+            self.assertIsNone(error)
+            self.assertEqual(count, 4)
+            client.optimize(4)
+            for threshold in [-6, -5, 0, 5, 10, 11]:
+                client.prepare_filter(IntFilter(int_value=threshold))
+                result = client.search_embedding([0., 1., 2., 3.], 10)
+                self.assertEqual(set(result), {i for i in ids if i >= threshold})
+            client.prepare_filter(non_filter)
+            self.assertEqual(set(client.search_embedding([0., 1., 2., 3.], 10)), set(ids))
+
     def test_spawn_handoff_concurrent_search_and_restart(self):
         self.assertIs(DB.KTANN.init_cls, KTANN)
         self.assertIs(DB.KTANN.config_cls, KTANNConfig)

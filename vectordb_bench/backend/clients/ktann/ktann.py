@@ -112,7 +112,7 @@ class Connection:
 
 
 class KTANN(VectorDB):
-    supported_filter_types = [FilterOp.NonFilter]
+    supported_filter_types = [FilterOp.NonFilter, FilterOp.NumGE]
 
     def __init__(
         self,
@@ -129,6 +129,7 @@ class KTANN(VectorDB):
         if not drop_old:
             raise ValueError("KTANN benchmark requires a fresh bridge and full load (drop_old=True)")
         self.name = "KTANN plus benchmark bridge"
+        self._id_min = None
         self.dim = dim
         self.db_config = dict(db_config)
         self._connection = None
@@ -179,8 +180,15 @@ class KTANN(VectorDB):
         return self._connection.request(op, **fields)
 
     def prepare_filter(self, filters: dict):
-        if filters.type != FilterOp.NonFilter:
-            raise ValueError("filters are unsupported")
+        if filters.type == FilterOp.NonFilter:
+            self._id_min = None
+        elif filters.type == FilterOp.NumGE and filters.int_field == "id":
+            threshold = operator.index(filters.int_value)
+            if not -(1 << 63) <= threshold < (1 << 63):
+                raise ValueError("filter threshold must be a signed 64-bit integer")
+            self._id_min = threshold
+        else:
+            raise ValueError("only numeric id >= threshold filters are supported")
 
     def insert_embeddings(
         self, embeddings: list[list[float]], metadata: list[int], labels_data: list[str] | None = None, **kwargs
@@ -223,4 +231,4 @@ class KTANN(VectorDB):
     ):
         if payload_profile != PayloadProfile.IDS_ONLY or tenant is not None:
             raise ValueError("only IDs-only, single-tenant search is supported")
-        return self._request("search", vector=[float(v) for v in query], k=int(k))["ids"]
+        return self._request("search", vector=[float(v) for v in query], k=int(k), id_min=self._id_min)["ids"]

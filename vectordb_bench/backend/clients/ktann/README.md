@@ -47,3 +47,12 @@ python -m unittest discover -s tests -p 'test_ktann_bridge.py' -v
 KTANN_TEST_BACKEND=foundationdb python -m unittest discover \
   -s tests -p 'test_ktann_bridge.py' -v
 ```
+
+
+Insert batches use binary float32 frames (at most 50 records), while control and
+search requests remain JSON. Update this client and the bridge together; the
+bridge rejects JSON inserts. Vectors are converted and checked once with NumPy;
+unknown outcomes are never automatically replayed. This transport is identical
+for online insertion and Bulk Build comparisons. In bulk mode, receipt directly
+writes canonical input frames; Optimize seals the input before constructing and
+publishing the index.

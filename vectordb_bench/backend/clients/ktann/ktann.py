@@ -1,7 +1,6 @@
 """Thin pickleable adapter; all database ownership stays in the Rust process."""
 
 import json
-import math
 import operator
 import os
 import socket
@@ -13,6 +12,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
+
 from ...filter import FilterOp
 from ...payload import PayloadProfile
 from ..api import PartialInsertError, VectorDB
@@ -20,9 +21,28 @@ from ..api import PartialInsertError, VectorDB
 if TYPE_CHECKING:
     from .config import KTANNCaseConfig
 
-VERSION = 1
+VERSION = 2
 MAX_FRAME = 8 << 20
 MAX_BATCH = 50
+
+
+def _encode_insert(fields: dict) -> bytes:
+    """Encode the bounded insert body once, without decimal float text."""
+    if set(fields) != {"ids", "vectors"}:
+        raise ValueError("insert requires IDs and vectors")
+    ids = [operator.index(value) for value in fields["ids"]]
+    if not 0 < len(ids) <= MAX_BATCH or any(not -(1 << 63) <= value < (1 << 63) for value in ids):
+        raise ValueError("invalid insert IDs or batch size")
+    with np.errstate(over="raise", invalid="raise"):
+        vectors = np.asarray(fields["vectors"], dtype="<f4")
+    if vectors.ndim != 2 or vectors.shape[0] != len(ids) or vectors.shape[1] == 0:
+        raise ValueError("IDs/vectors shape mismatch")
+    if 12 + len(ids) * 8 + vectors.nbytes > MAX_FRAME:
+        raise ValueError("bridge frame exceeds 8 MiB")
+    if not np.isfinite(vectors).all():
+        raise ValueError("nonfinite vector")
+    return (b"KTI\x02" + struct.pack("!II", len(ids), vectors.shape[1])
+            + struct.pack(f"<{len(ids)}q", *ids) + vectors.tobytes(order="C"))
 
 
 class BridgeError(RuntimeError):
@@ -65,7 +85,8 @@ class Connection:
             self.first_insert_ns = time.monotonic_ns()
         measure = self.collect_metrics and op == "search"
         started = time.perf_counter() if measure else 0.0
-        data = json.dumps({"version": VERSION, "op": op, **fields}, separators=(",", ":"), allow_nan=False).encode()
+        data = (_encode_insert(fields) if op == "insert" else
+                json.dumps({"version": VERSION, "op": op, **fields}, separators=(",", ":"), allow_nan=False).encode())
         encoded = time.perf_counter() if measure else 0.0
         if len(data) > MAX_FRAME:
             raise ValueError("bridge frame exceeds 8 MiB")
@@ -194,12 +215,10 @@ class KTANN(VectorDB):
                 raise ValueError("IDs/vectors length mismatch")  # noqa: TRY301
             # Split at the client boundary; each wire batch is a bounded atomic import.
             for offset in range(0, len(metadata), MAX_BATCH):
-                ids = [operator.index(i) for i in metadata[offset : offset + MAX_BATCH]]
-                if any(not -(1 << 63) <= i < (1 << 63) for i in ids):
-                    raise ValueError("IDs must be signed 64-bit integers")  # noqa: TRY301
-                vectors = [[float(v) for v in row] for row in embeddings[offset : offset + MAX_BATCH]]
-                if any(len(row) != self.dim or any(not math.isfinite(v) for v in row) for row in vectors):
-                    raise ValueError("wrong dimension or nonfinite vector")  # noqa: TRY301
+                ids = metadata[offset : offset + MAX_BATCH]
+                vectors = embeddings[offset : offset + MAX_BATCH]
+                if any(len(row) != self.dim for row in vectors):
+                    raise ValueError("wrong vector dimension")  # noqa: TRY301
                 result = self._request("insert", ids=ids, vectors=vectors)
                 if result["inserted"] != len(ids):
                     raise BridgeError("incomplete insert response")  # noqa: TRY301

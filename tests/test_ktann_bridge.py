@@ -51,7 +51,7 @@ class BridgeTests(unittest.TestCase):
         self.addCleanup(self.cleanup)
         self.start()
 
-    def start(self):
+    def start(self, *, bulk=False):
         self.log = (self.root / "stderr.log").open("a")
         self.process = subprocess.Popen(
             [
@@ -64,6 +64,7 @@ class BridgeTests(unittest.TestCase):
                 self.database,
                 "--report",
                 str(self.root / "bridge.json"),
+                *(["--bulk-workspace", str(self.root / "bulk")] if bulk else []),
             ],
             stderr=self.log,
         )
@@ -163,6 +164,32 @@ class BridgeTests(unittest.TestCase):
         self.start()  # proves Runtime shutdown released native RocksDB ownership
         self.client()
         self.stop()
+
+    def test_bulk_captures_canonical_input_before_optimize(self):
+        self.stop()
+        self.start(bulk=True)
+        client = self.client(MetricType.L2, companion=False)
+        source = self.root / "bulk" / "source"
+        with client.init():
+            vectors = [[float(i), 1.0, 2.0, 3.0] for i in range(80)]
+            self.assertEqual(client.insert_embeddings(vectors, list(range(80))), (80, None))
+            self.assertTrue((source / "data.partial").exists())
+            self.assertFalse((source / "manifest.bin").exists())
+            self.assertFalse((self.root / "bulk" / "input.bin").exists())
+            client.optimize(80)
+            self.assertTrue((source / "manifest.bin").exists())
+            self.assertEqual(client.search_embedding(vectors[7], 1), [7])
+
+    def test_binary_insert_rejects_invalid_tail_without_losing_confirmed_prefix(self):
+        client = self.client(MetricType.L2, companion=False)
+        with client.init():
+            vectors = [[float(i), 1.0, -0.0, 3.0] for i in range(51)]
+            vectors[-1][0] = float("nan")
+            count, error = client.insert_embeddings(vectors, list(range(51)))
+            self.assertEqual(count, 50)
+            self.assertTrue(error.non_retryable)
+            client.optimize(50)
+            self.assertEqual(client.search_embedding([7.0, 1.0, -0.0, 3.0], 1), [7])
 
     def test_boundaries_and_error_mapping(self):
         client = self.client(MetricType.COSINE, companion=False)

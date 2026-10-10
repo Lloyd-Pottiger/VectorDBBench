@@ -21,7 +21,7 @@ from ..api import PartialInsertError, VectorDB
 if TYPE_CHECKING:
     from .config import KTANNCaseConfig
 
-VERSION = 2
+VERSION = 1
 MAX_FRAME = 8 << 20
 MAX_BATCH = 50
 
@@ -41,7 +41,7 @@ def _encode_insert(fields: dict) -> bytes:
         raise ValueError("bridge frame exceeds 8 MiB")
     if not np.isfinite(vectors).all():
         raise ValueError("nonfinite vector")
-    return (b"KTI\x02" + struct.pack("!II", len(ids), vectors.shape[1])
+    return (b"KTI\x01" + struct.pack("!II", len(ids), vectors.shape[1])
             + struct.pack(f"<{len(ids)}q", *ids) + vectors.tobytes(order="C"))
 
 

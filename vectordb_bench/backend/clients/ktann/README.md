@@ -17,7 +17,7 @@ cargo build --release -p ktann-benchmarks --bin ktann-vdbbench-bridge
 # FoundationDB additionally requires --all-features and its native client/cluster.
 target/release/ktann-vdbbench-bridge --backend rocksdb \
   --socket /tmp/ktann-bench.sock --database /tmp/ktann-bench-db \
-  --report /tmp/ktann-bridge.json --bulk-workspace /tmp/ktann-bulk
+  --report /tmp/ktann-bridge.json
 ```
 
 In another terminal, from VectorDBBench with its dependencies installed:
@@ -29,8 +29,9 @@ vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
   --load-concurrency 1 --insert-batch-size 50 --k 100
 ```
 
-Use a fresh bridge, a new absolute `--bulk-workspace` directory, and a dedicated
-backend location for each case. All imports use Bulk Build; there is no online
+Use a fresh bridge and a dedicated backend location for each case. The bridge
+automatically creates and cleans up its temporary workspace on normal exit. Set
+`TMPDIR` to choose a disk with sufficient space. All imports use Bulk Build; there is no online
 `batch_mutate` mode. Optimize seals the source, constructs and publishes the
 index, then runs offline refinement before search is enabled.
 
@@ -70,4 +71,5 @@ search requests remain JSON. Update this client and the bridge together; reset
 now carries refinement controls. Vectors are converted and checked once with
 NumPy. Receipt writes canonical source frames and sort runs; it does not commit
 searchable batches. Duplicate IDs may fail at Optimize. Unknown outcomes are never
-automatically replayed. Source snapshots remain caller-owned after shutdown.
+automatically replayed. Source snapshots are temporary and removed on normal shutdown; a crash may leave
+temporary files behind.

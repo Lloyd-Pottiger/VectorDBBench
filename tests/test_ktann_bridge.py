@@ -53,7 +53,8 @@ class BridgeTests(unittest.TestCase):
 
     def start(self):
         self.starts = getattr(self, "starts", 0) + 1
-        self.bulk_root = self.root / f"bulk-{self.starts}"
+        self.scratch = self.root / f"scratch-{self.starts}"
+        self.scratch.mkdir()
         self.log = (self.root / "stderr.log").open("a")
         self.process = subprocess.Popen(
             [
@@ -66,9 +67,9 @@ class BridgeTests(unittest.TestCase):
                 self.database,
                 "--report",
                 str(self.root / "bridge.json"),
-                "--bulk-workspace", str(self.bulk_root),
             ],
             stderr=self.log,
+            env=dict(os.environ, TMPDIR=str(self.scratch)),
         )
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -93,6 +94,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.process.wait(timeout=30), 0)
         self.log.close()
         self.assertFalse(Path(self.socket).exists())
+        self.assertEqual(list(self.scratch.iterdir()), [])
         self.process = None
 
     def cleanup(self):
@@ -173,13 +175,14 @@ class BridgeTests(unittest.TestCase):
 
     def test_bulk_captures_canonical_input_before_optimize(self):
         client = self.client(MetricType.L2, companion=False)
-        source = self.bulk_root / "source"
+        bulk_root = next(self.scratch.glob("ktann-vdbbench-*")) / "bulk"
+        source = bulk_root / "source"
         with client.init():
             vectors = [[float(i), 1.0, 2.0, 3.0] for i in range(80)]
             self.assertEqual(client.insert_embeddings(vectors, list(range(80))), (80, None))
             self.assertTrue((source / "data.partial").exists())
             self.assertFalse((source / "manifest.bin").exists())
-            self.assertFalse((self.bulk_root / "input.bin").exists())
+            self.assertFalse((bulk_root / "input.bin").exists())
             client.optimize(80)
             self.assertTrue((source / "manifest.bin").exists())
             self.assertEqual(client.search_embedding(vectors[7], 1), [7])
@@ -345,8 +348,6 @@ class BridgeTests(unittest.TestCase):
                 self.database,
                 "--report",
                 str(self.root / "other.json"),
-                "--bulk-workspace",
-                str(self.root / "other-bulk"),
             ],
             capture_output=True,
             timeout=30,

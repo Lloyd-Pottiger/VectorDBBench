@@ -51,7 +51,10 @@ class BridgeTests(unittest.TestCase):
         self.addCleanup(self.cleanup)
         self.start()
 
-    def start(self, *, bulk=False):
+    def start(self):
+        self.starts = getattr(self, "starts", 0) + 1
+        self.scratch = self.root / f"scratch-{self.starts}"
+        self.scratch.mkdir()
         self.log = (self.root / "stderr.log").open("a")
         self.process = subprocess.Popen(
             [
@@ -64,9 +67,9 @@ class BridgeTests(unittest.TestCase):
                 self.database,
                 "--report",
                 str(self.root / "bridge.json"),
-                *(["--bulk-workspace", str(self.root / "bulk")] if bulk else []),
             ],
             stderr=self.log,
+            env=dict(os.environ, TMPDIR=str(self.scratch)),
         )
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -91,6 +94,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.process.wait(timeout=30), 0)
         self.log.close()
         self.assertFalse(Path(self.socket).exists())
+        self.assertEqual(list(self.scratch.iterdir()), [])
         self.process = None
 
     def cleanup(self):
@@ -156,6 +160,10 @@ class BridgeTests(unittest.TestCase):
         report = json.loads((self.root / "bridge.json").read_text())
         self.assertTrue(report["ready"])
         self.assertEqual(report["records"], 200)
+        self.assertEqual(report["build_mode"], "bulk")
+        self.assertEqual(report["refinement"]["rounds"], 2)
+        self.assertEqual(report["refinement"]["input_bytes"], 32 << 30)
+        self.assertGreater(report["phases"]["refinement_seconds"], 0)
         self.assertEqual(report["searches"], 40)
         self.assertGreater(report["continuous_first_insert_through_final_search_seconds"], 0)
         self.assertEqual(
@@ -166,16 +174,15 @@ class BridgeTests(unittest.TestCase):
         self.stop()
 
     def test_bulk_captures_canonical_input_before_optimize(self):
-        self.stop()
-        self.start(bulk=True)
         client = self.client(MetricType.L2, companion=False)
-        source = self.root / "bulk" / "source"
+        bulk_root = next(self.scratch.glob("ktann-vdbbench-*")) / "bulk"
+        source = bulk_root / "source"
         with client.init():
             vectors = [[float(i), 1.0, 2.0, 3.0] for i in range(80)]
             self.assertEqual(client.insert_embeddings(vectors, list(range(80))), (80, None))
             self.assertTrue((source / "data.partial").exists())
             self.assertFalse((source / "manifest.bin").exists())
-            self.assertFalse((self.root / "bulk" / "input.bin").exists())
+            self.assertFalse((bulk_root / "input.bin").exists())
             client.optimize(80)
             self.assertTrue((source / "manifest.bin").exists())
             self.assertEqual(client.search_embedding(vectors[7], 1), [7])
@@ -198,9 +205,6 @@ class BridgeTests(unittest.TestCase):
                 client.search_embedding([1.0, 0.0, 0.0, 0.0])
             count, error = client.insert_embeddings([[1.0, 0.0, 0.0, 0.0]], [-(1 << 63)])
             self.assertEqual((count, error), (1, None))
-            count, error = client.insert_embeddings([[1.0, 0.0, 0.0, 0.0]], [-(1 << 63)])
-            self.assertEqual(count, 0)
-            self.assertTrue(error.non_retryable)
             count, error = client.insert_embeddings([[1.0, 2.0]], [3])
             self.assertEqual(count, 0)
             self.assertTrue(error.non_retryable)
@@ -208,6 +212,9 @@ class BridgeTests(unittest.TestCase):
                 client.optimize(2)
             client.optimize(1)
             self.assertEqual(client.search_embedding([1.0, 0.0, 0.0, 0.0], 1), [-(1 << 63)])
+            count, error = client.insert_embeddings([[1.0, 0.0, 0.0, 0.0]], [-(1 << 63)])
+            self.assertEqual(count, 0)
+            self.assertTrue(error.non_retryable)
         timing.perf_counter.assert_not_called()
         timing.monotonic_ns.assert_not_called()
         self.assertFalse((self.root / "clients").exists())
@@ -273,6 +280,10 @@ class BridgeTests(unittest.TestCase):
             "1",
             "--load-concurrency",
             "1",
+            "--refinement-rounds",
+            "1",
+            "--refinement-input-bytes",
+            str(32 << 20),
             "--k",
             "10",
             "--num-concurrency",
@@ -298,6 +309,9 @@ class BridgeTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["serial_latency_p95"], metrics["serial_latency_p50"])
         self.assertGreater(metrics["recall"], 0.9)
         self.assertFalse((self.root / "clients").exists())
+        self.stop()
+        report = json.loads((self.root / "bridge.json").read_text())
+        self.assertEqual(report["refinement"], {"rounds": 1, "input_bytes": 32 << 20})
 
     def test_partial_frame_shutdown_and_crash_restart(self):
         client = self.client()

@@ -26,13 +26,14 @@ In another terminal, from VectorDBBench with its dependencies installed:
 pip install -e .
 vectordbbench ktann --socket-path /tmp/ktann-bench.sock \
   --dataset-identity cohere-1m --case-type Performance768D1M \
-  --load-concurrency 1 --insert-batch-size 50 --k 100
+  --load-concurrency 1 --insert-batch-size 50 --k 100 \
+  --refinement-rounds 2 --refinement-memory-bytes 34359738368
 ```
 
 Use a fresh bridge and dedicated backend location for each case. Stop it with
 Ctrl-C after the run; shutdown removes the benchmark index and socket. For
 protocol details and FoundationDB setup, see the
-[KTANN benchmark documentation](https://github.com/Lloyd-Pottiger/ktann/blob/main/benchmarks/README.md#vectordbbench-interoperability).
+[KTANN benchmark documentation](https://github.com/Lloyd-Pottiger/ktann/blob/main/benchmarks/README.md#vectordbbench).
 
 Canonical results are produced by VectorDBBench. Optional `--companion-dir DIR`
 collects additional per-client timings; without it, client timing collection
@@ -54,7 +55,10 @@ KTANN_TEST_BACKEND=foundationdb python -m unittest discover \
 Insert batches use binary float32 frames (at most 50 records), while control and
 search requests remain JSON. Update this client and the bridge together; the
 bridge rejects JSON inserts. Vectors are converted and checked once with NumPy;
-unknown outcomes are never automatically replayed. This transport is identical
-for online insertion and Bulk Build comparisons. In bulk mode, receipt directly
-writes canonical input frames; Optimize seals the input before constructing and
-publishing the index.
+unknown outcomes are never automatically replayed. Receipt directly writes canonical input frames. Optimize seals the input,
+constructs and refines the forest, then encodes, loads and publishes the index.
+Zero refinement rounds refresh centroids without moving records. The positive
+`--refinement-memory-bytes` limit accounts for retained inputs, topology and
+refinement planning; it is not a process RSS limit. It applies in every routing
+mode. Budget failures are terminal for this case; restart with adequate resources.
+Search is gated until publication and any global router preparation complete.

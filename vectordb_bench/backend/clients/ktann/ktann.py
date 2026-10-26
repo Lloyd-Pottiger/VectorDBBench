@@ -165,6 +165,7 @@ class KTANN(VectorDB):
                 dimension=dim,
                 metric=metric,
                 dataset=self.db_config["dataset"],
+                **db_case_config.index_param(),
                 **db_case_config.search_param(),
             )
         finally:

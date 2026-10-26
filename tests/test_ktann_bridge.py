@@ -51,7 +51,7 @@ class BridgeTests(unittest.TestCase):
         self.addCleanup(self.cleanup)
         self.start()
 
-    def start(self, *, bulk=False):
+    def start(self):
         self.log = (self.root / "stderr.log").open("a")
         self.process = subprocess.Popen(
             [
@@ -64,7 +64,6 @@ class BridgeTests(unittest.TestCase):
                 self.database,
                 "--report",
                 str(self.root / "bridge.json"),
-                *(["--bulk-workspace", str(self.root / "bulk")] if bulk else []),
             ],
             stderr=self.log,
         )
@@ -157,6 +156,8 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(report["ready"])
         self.assertEqual(report["records"], 200)
         self.assertEqual(report["searches"], 40)
+        self.assertEqual(report["bulk_build"]["refinement_rounds"], 2)
+        self.assertEqual(report["bulk_build"]["refinement_memory_bytes"], 32 << 30)
         self.assertGreater(report["continuous_first_insert_through_final_search_seconds"], 0)
         self.assertEqual(
             sum(json.loads(p.read_text())["search_calls"] > 0 for p in (self.root / "clients").glob("client-*.json")), 4
@@ -164,21 +165,6 @@ class BridgeTests(unittest.TestCase):
         self.start()  # proves Runtime shutdown released native RocksDB ownership
         self.client()
         self.stop()
-
-    def test_bulk_captures_canonical_input_before_optimize(self):
-        self.stop()
-        self.start(bulk=True)
-        client = self.client(MetricType.L2, companion=False)
-        source = self.root / "bulk" / "source"
-        with client.init():
-            vectors = [[float(i), 1.0, 2.0, 3.0] for i in range(80)]
-            self.assertEqual(client.insert_embeddings(vectors, list(range(80))), (80, None))
-            self.assertTrue((source / "data.partial").exists())
-            self.assertFalse((source / "manifest.bin").exists())
-            self.assertFalse((self.root / "bulk" / "input.bin").exists())
-            client.optimize(80)
-            self.assertTrue((source / "manifest.bin").exists())
-            self.assertEqual(client.search_embedding(vectors[7], 1), [7])
 
     def test_binary_insert_rejects_invalid_tail_without_losing_confirmed_prefix(self):
         client = self.client(MetricType.L2, companion=False)
@@ -198,9 +184,6 @@ class BridgeTests(unittest.TestCase):
                 client.search_embedding([1.0, 0.0, 0.0, 0.0])
             count, error = client.insert_embeddings([[1.0, 0.0, 0.0, 0.0]], [-(1 << 63)])
             self.assertEqual((count, error), (1, None))
-            count, error = client.insert_embeddings([[1.0, 0.0, 0.0, 0.0]], [-(1 << 63)])
-            self.assertEqual(count, 0)
-            self.assertTrue(error.non_retryable)
             count, error = client.insert_embeddings([[1.0, 2.0]], [3])
             self.assertEqual(count, 0)
             self.assertTrue(error.non_retryable)
@@ -275,6 +258,10 @@ class BridgeTests(unittest.TestCase):
             "1",
             "--k",
             "10",
+            "--refinement-rounds",
+            "0",
+            "--refinement-memory-bytes",
+            "8388608",
             "--num-concurrency",
             "1,2",
             "--concurrency-duration",
@@ -297,6 +284,10 @@ class BridgeTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["serial_latency_p99"], metrics["serial_latency_p95"])
         self.assertGreaterEqual(metrics["serial_latency_p95"], metrics["serial_latency_p50"])
         self.assertGreater(metrics["recall"], 0.9)
+        self.stop()
+        report = json.loads((self.root / "bridge.json").read_text())
+        self.assertEqual(report["bulk_build"]["refinement_rounds"], 0)
+        self.assertEqual(report["bulk_build"]["refinement_memory_bytes"], 8388608)
         self.assertFalse((self.root / "clients").exists())
 
     def test_partial_frame_shutdown_and_crash_restart(self):

@@ -17,15 +17,14 @@ class KTANNConfig(DBConfig):
 class KTANNCaseConfig(BaseModel, DBCaseConfig):
     metric_type: MetricType | None = None
     leaf_beam: int | None = Field(default=None, ge=1, le=16384)
+
     refinement_rounds: int = Field(default=2, ge=0, le=5)
-    refinement_input_bytes: int = Field(default=32 << 30, gt=0)
+    refinement_memory_bytes: int = Field(default=32 << 30, gt=0)
 
     def index_param(self) -> dict:
         return {
-            "min_partition_entries": 64,
-            "max_partition_entries": 512,
             "refinement_rounds": self.refinement_rounds,
-            "refinement_input_bytes": self.refinement_input_bytes,
+            "refinement_memory_bytes": self.refinement_memory_bytes,
         }
 
     def search_param(self) -> dict:

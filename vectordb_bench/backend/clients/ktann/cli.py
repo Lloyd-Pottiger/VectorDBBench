@@ -13,8 +13,9 @@ class KTANNTypedDict(CommonTypedDict):
     dataset_identity: Annotated[str, click.option("--dataset-identity", required=True)]
     companion_dir: Annotated[str | None, click.option("--companion-dir", default=None)]
     leaf_beam: Annotated[int | None, click.option("--leaf-beam", type=int, default=None)]
+
     refinement_rounds: Annotated[int, click.option("--refinement-rounds", type=click.IntRange(0, 5), default=2)]
-    refinement_input_bytes: Annotated[int, click.option("--refinement-input-bytes", type=click.IntRange(min=1), default=32 << 30)]
+    refinement_memory_bytes: Annotated[int, click.option("--refinement-memory-bytes", type=click.IntRange(min=1), default=32 << 30)]
 
 
 @cli.command()
@@ -35,7 +36,7 @@ def KTANN(**parameters: Unpack[KTANNTypedDict]):
         db_case_config=KTANNCaseConfig(
             leaf_beam=parameters["leaf_beam"],
             refinement_rounds=parameters["refinement_rounds"],
-            refinement_input_bytes=parameters["refinement_input_bytes"],
+            refinement_memory_bytes=parameters["refinement_memory_bytes"],
         ),
         **parameters,
     )

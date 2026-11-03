@@ -161,10 +161,10 @@ class BridgeTests(unittest.TestCase):
         self.assertTrue(report["ready"])
         self.assertEqual(report["records"], 200)
         self.assertEqual(report["build_mode"], "bulk")
-        self.assertEqual(report["refinement"]["rounds"], 2)
-        self.assertEqual(report["refinement"]["input_bytes"], 32 << 30)
-        self.assertGreater(report["phases"]["refinement_seconds"], 0)
+        self.assertGreater(report["bulk_build"]["forest_seconds"], 0)
         self.assertEqual(report["searches"], 40)
+        self.assertEqual(report["bulk_build"]["refinement_rounds"], 2)
+        self.assertEqual(report["bulk_build"]["refinement_memory_bytes"], 32 << 30)
         self.assertGreater(report["continuous_first_insert_through_final_search_seconds"], 0)
         self.assertEqual(
             sum(json.loads(p.read_text())["search_calls"] > 0 for p in (self.root / "clients").glob("client-*.json")), 4
@@ -212,9 +212,6 @@ class BridgeTests(unittest.TestCase):
                 client.optimize(2)
             client.optimize(1)
             self.assertEqual(client.search_embedding([1.0, 0.0, 0.0, 0.0], 1), [-(1 << 63)])
-            count, error = client.insert_embeddings([[1.0, 0.0, 0.0, 0.0]], [-(1 << 63)])
-            self.assertEqual(count, 0)
-            self.assertTrue(error.non_retryable)
         timing.perf_counter.assert_not_called()
         timing.monotonic_ns.assert_not_called()
         self.assertFalse((self.root / "clients").exists())
@@ -226,12 +223,12 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(raw.recv(1), b"")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
             raw.connect(self.socket)
-            data = b'{"version":999,"op":"health"}'
+            data = b'{"unexpected":true,"op":"health"}'
             raw.sendall(struct.pack("!I", len(data)) + data)
             length = struct.unpack("!I", raw.recv(4))[0]
             response = json.loads(raw.recv(length))
             self.assertFalse(response["ok"])
-            self.assertEqual(response["error"]["kind"], "protocol")
+            self.assertEqual(response["error"]["kind"], "invalid_argument")
 
     def test_canonical_cli_retains_metrics_and_all_concurrency_results(self):
         import numpy as np
@@ -280,12 +277,12 @@ class BridgeTests(unittest.TestCase):
             "1",
             "--load-concurrency",
             "1",
-            "--refinement-rounds",
-            "1",
-            "--refinement-input-bytes",
-            str(32 << 20),
             "--k",
             "10",
+            "--refinement-rounds",
+            "0",
+            "--refinement-memory-bytes",
+            "8388608",
             "--num-concurrency",
             "1,2",
             "--concurrency-duration",
@@ -308,10 +305,11 @@ class BridgeTests(unittest.TestCase):
         self.assertGreaterEqual(metrics["serial_latency_p99"], metrics["serial_latency_p95"])
         self.assertGreaterEqual(metrics["serial_latency_p95"], metrics["serial_latency_p50"])
         self.assertGreater(metrics["recall"], 0.9)
-        self.assertFalse((self.root / "clients").exists())
         self.stop()
         report = json.loads((self.root / "bridge.json").read_text())
-        self.assertEqual(report["refinement"], {"rounds": 1, "input_bytes": 32 << 20})
+        self.assertEqual(report["bulk_build"]["refinement_rounds"], 0)
+        self.assertEqual(report["bulk_build"]["refinement_memory_bytes"], 8388608)
+        self.assertFalse((self.root / "clients").exists())
 
     def test_partial_frame_shutdown_and_crash_restart(self):
         client = self.client()

@@ -62,3 +62,6 @@ Zero refinement rounds refresh centroids without moving records. The positive
 refinement planning; it is not a process RSS limit. It applies in every routing
 mode. Budget failures are terminal for this case; restart with adequate resources.
 Search is gated until publication and any global router preparation complete.
+
+Duplicate IDs may fail at Optimize. Source snapshots are temporary and removed
+on normal shutdown; a crash may leave temporary files behind.

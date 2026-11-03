@@ -52,6 +52,9 @@ class BridgeTests(unittest.TestCase):
         self.start()
 
     def start(self):
+        self.starts = getattr(self, "starts", 0) + 1
+        self.scratch = self.root / f"scratch-{self.starts}"
+        self.scratch.mkdir()
         self.log = (self.root / "stderr.log").open("a")
         self.process = subprocess.Popen(
             [
@@ -66,6 +69,7 @@ class BridgeTests(unittest.TestCase):
                 str(self.root / "bridge.json"),
             ],
             stderr=self.log,
+            env=dict(os.environ, TMPDIR=str(self.scratch)),
         )
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
@@ -90,6 +94,7 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(self.process.wait(timeout=30), 0)
         self.log.close()
         self.assertFalse(Path(self.socket).exists())
+        self.assertEqual(list(self.scratch.iterdir()), [])
         self.process = None
 
     def cleanup(self):
@@ -155,6 +160,8 @@ class BridgeTests(unittest.TestCase):
         report = json.loads((self.root / "bridge.json").read_text())
         self.assertTrue(report["ready"])
         self.assertEqual(report["records"], 200)
+        self.assertEqual(report["build_mode"], "bulk")
+        self.assertGreater(report["bulk_build"]["forest_seconds"], 0)
         self.assertEqual(report["searches"], 40)
         self.assertEqual(report["bulk_build"]["refinement_rounds"], 2)
         self.assertEqual(report["bulk_build"]["refinement_memory_bytes"], 32 << 30)
@@ -165,6 +172,20 @@ class BridgeTests(unittest.TestCase):
         self.start()  # proves Runtime shutdown released native RocksDB ownership
         self.client()
         self.stop()
+
+    def test_bulk_captures_canonical_input_before_optimize(self):
+        client = self.client(MetricType.L2, companion=False)
+        bulk_root = next(self.scratch.glob("ktann-vdbbench-*")) / "bulk"
+        source = bulk_root / "source"
+        with client.init():
+            vectors = [[float(i), 1.0, 2.0, 3.0] for i in range(80)]
+            self.assertEqual(client.insert_embeddings(vectors, list(range(80))), (80, None))
+            self.assertTrue((source / "data.partial").exists())
+            self.assertFalse((source / "manifest.bin").exists())
+            self.assertFalse((bulk_root / "input.bin").exists())
+            client.optimize(80)
+            self.assertTrue((source / "manifest.bin").exists())
+            self.assertEqual(client.search_embedding(vectors[7], 1), [7])
 
     def test_binary_insert_rejects_invalid_tail_without_losing_confirmed_prefix(self):
         client = self.client(MetricType.L2, companion=False)

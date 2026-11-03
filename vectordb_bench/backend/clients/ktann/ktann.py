@@ -21,7 +21,6 @@ from ..api import PartialInsertError, VectorDB
 if TYPE_CHECKING:
     from .config import KTANNCaseConfig
 
-VERSION = 1
 MAX_FRAME = 8 << 20
 MAX_BATCH = 50
 
@@ -37,11 +36,11 @@ def _encode_insert(fields: dict) -> bytes:
         vectors = np.asarray(fields["vectors"], dtype="<f4")
     if vectors.ndim != 2 or vectors.shape[0] != len(ids) or vectors.shape[1] == 0:
         raise ValueError("IDs/vectors shape mismatch")
-    if 12 + len(ids) * 8 + vectors.nbytes > MAX_FRAME:
+    if 11 + len(ids) * 8 + vectors.nbytes > MAX_FRAME:
         raise ValueError("bridge frame exceeds 8 MiB")
     if not np.isfinite(vectors).all():
         raise ValueError("nonfinite vector")
-    return (b"KTI\x01" + struct.pack("!II", len(ids), vectors.shape[1])
+    return (b"KTI" + struct.pack("!II", len(ids), vectors.shape[1])
             + struct.pack(f"<{len(ids)}q", *ids) + vectors.tobytes(order="C"))
 
 
@@ -86,7 +85,7 @@ class Connection:
         measure = self.collect_metrics and op == "search"
         started = time.perf_counter() if measure else 0.0
         data = (_encode_insert(fields) if op == "insert" else
-                json.dumps({"version": VERSION, "op": op, **fields}, separators=(",", ":"), allow_nan=False).encode())
+                json.dumps({"op": op, **fields}, separators=(",", ":"), allow_nan=False).encode())
         encoded = time.perf_counter() if measure else 0.0
         if len(data) > MAX_FRAME:
             raise ValueError("bridge frame exceeds 8 MiB")
@@ -99,8 +98,6 @@ class Connection:
             decode_started = time.perf_counter() if measure else 0.0
             response = json.loads(data)
             finished = time.perf_counter() if measure else 0.0
-            if response.get("version") != VERSION:
-                raise BridgeError("bridge version mismatch")
             if not response.get("ok"):
                 raise BridgeError(str(response.get("error")))
             result = response["result"]
@@ -118,7 +115,6 @@ class Connection:
     def report(self):
         return {
             "label": "KTANN plus benchmark bridge — client companion",
-            "protocol_version": VERSION,
             "first_insert_monotonic_ns": self.first_insert_ns,
             "last_search_monotonic_ns": self.last_search_ns,
             "pid": os.getpid(),

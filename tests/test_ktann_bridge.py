@@ -202,12 +202,12 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(raw.recv(1), b"")
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as raw:
             raw.connect(self.socket)
-            data = b'{"version":999,"op":"health"}'
+            data = b'{"unexpected":true,"op":"health"}'
             raw.sendall(struct.pack("!I", len(data)) + data)
             length = struct.unpack("!I", raw.recv(4))[0]
             response = json.loads(raw.recv(length))
             self.assertFalse(response["ok"])
-            self.assertEqual(response["error"]["kind"], "protocol")
+            self.assertEqual(response["error"]["kind"], "invalid_argument")
 
     def test_canonical_cli_retains_metrics_and_all_concurrency_results(self):
         import numpy as np

@@ -1337,3 +1337,7 @@ This multi-tiered timeout approach allows our benchmark to be more representativ
 </table>
 
 **Note:** Some datapoints in the standard benchmark results that violate this timeout will be kept for now for reference. We will remove them in the future.
+
+### KTANN bridge
+
+See [KTANN client usage and filter workloads](docs/ktann.md) for setup, supported filters, official label ground truth and real-process tests.

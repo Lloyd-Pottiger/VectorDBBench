@@ -14,11 +14,13 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from vectordb_bench.backend.clients import DB
 from vectordb_bench.backend.clients.api import MetricType
 from vectordb_bench.backend.clients.ktann.config import KTANNCaseConfig, KTANNConfig
-from vectordb_bench.backend.clients.ktann.ktann import BridgeError, Connection, KTANN, MAX_FRAME
+from vectordb_bench.backend.clients.ktann.ktann import BridgeError, Connection, KTANN, MAX_FRAME, _encode_insert
+from vectordb_bench.backend.filter import FilterOp, IntFilter, non_filter
 
 
 def worker(client, operation, queue):
@@ -109,11 +111,11 @@ class BridgeTests(unittest.TestCase):
             self.log.close()
         self.directory.cleanup()
 
-    def client(self, metric=MetricType.L2, *, companion=True):
+    def client(self, metric=MetricType.L2, *, companion=True, with_scalar_labels=False):
         config = {"socket_path": self.socket, "dataset": "synthetic-test-200"}
         if companion:
             config["companion_dir"] = str(self.root / "clients")
-        return KTANN(4, config, KTANNCaseConfig(metric_type=metric), drop_old=True)
+        return KTANN(4, config, KTANNCaseConfig(metric_type=metric), drop_old=True, with_scalar_labels=with_scalar_labels)
 
     def spawn(self, client, operation, count=1):
         context = mp.get_context("spawn")
@@ -145,6 +147,74 @@ class BridgeTests(unittest.TestCase):
                 self.assertEqual(set(result), {i for i in ids if i >= threshold})
             client.prepare_filter(non_filter)
             self.assertEqual(set(client.search_embedding([0., 1., 2., 3.], 10)), set(ids))
+
+    def test_labels_align_across_batches_and_filter_transitions(self):
+        client = self.client(with_scalar_labels=True)
+        labels = ["A", "B", "", "é", "e\u0301", "界" * 341 + "a"] * 20
+        ids = list(range(len(labels)))
+        vectors = [[float(i), 1., 2., 3.] for i in ids]
+        def label_filter(value):
+            return SimpleNamespace(type=FilterOp.StrEqual, label_field="labels", label_value=value)
+        with client.init():
+            # Validate the full label list before the first of several wire batches.
+            for bad in [labels[:-1], labels[:-1] + [1], labels[:-1] + ["界" * 342], None]:
+                count, error = client.insert_embeddings(vectors, ids, labels_data=bad)
+                self.assertEqual(count, 0)
+                self.assertTrue(error.non_retryable)
+            # Bypass client schema validation to exercise the bridge boundary.
+            with self.assertRaises(BridgeError):
+                client._request("insert", ids=[999], vectors=[[1., 2., 3., 4.]], labels=None)
+            self.assertEqual(client.insert_embeddings(vectors, ids, labels_data=labels), (len(ids), None))
+            client.optimize(len(ids))
+            for value in ["A", "B", "missing", "", "é", "e\u0301", "界" * 341 + "a"]:
+                client.prepare_filter(label_filter(value))
+                self.assertEqual(set(client.search_embedding(vectors[0], 200)),
+                                 {i for i in ids if labels[i] == value})
+            client.prepare_filter(IntFilter(int_value=65))
+            self.assertEqual(set(client.search_embedding(vectors[0], 200)), set(ids[65:]))
+            client.prepare_filter(non_filter)
+            self.assertEqual(set(client.search_embedding(vectors[0], 200)), set(ids))
+            client.prepare_filter(label_filter("B"))
+            self.assertEqual(set(client.search_embedding(vectors[0], 200)), {i for i in ids if labels[i] == "B"})
+        # The complete label predicate survives pickling into search workers.
+        results = self.spawn(client, "search", count=2)
+        self.assertTrue(all(len(hits) == 1 and labels[hits[0]] == "B" for worker_hits in results for hits in worker_hits))
+        self.stop()
+        report = json.loads((self.root / "bridge.json").read_text())
+        self.assertTrue(report["with_scalar_labels"])
+
+    def test_malformed_label_frame_has_no_partial_import(self):
+        client = self.client(with_scalar_labels=True)
+        fields = {"ids": [7, 8], "vectors": [[1., 2., 3., 4.]] * 2, "labels": ["A", "B"]}
+        frame = _encode_insert(fields)
+        for bad in [frame[:-1], frame + b"x", frame[:-1] + b"\xff"]:
+            connection = Connection(self.socket)
+            try:
+                connection.socket.sendall(struct.pack("!I", len(bad)) + bad)
+                size = struct.unpack("!I", connection.socket.recv(4))[0]
+                response = bytearray()
+                while len(response) < size:
+                    chunk = connection.socket.recv(size - len(response))
+                    self.assertTrue(chunk, "bridge closed before a complete response")
+                    response.extend(chunk)
+                self.assertEqual(json.loads(response)["error"]["kind"], "invalid_argument")
+            finally:
+                connection.close()
+        with client.init():
+            self.assertEqual(client.insert_embeddings(fields["vectors"], fields["ids"], fields["labels"]), (2, None))
+            client.optimize(2)
+            self.assertEqual(set(client.search_embedding([1., 2., 3., 4.], 10)), {7, 8})
+
+    def test_id_only_schema_rejects_label_data_and_queries(self):
+        client = self.client()
+        with client.init():
+            with self.assertRaises(BridgeError):
+                client._request("insert", ids=[7], vectors=[[1., 2., 3., 4.]], labels=["A"])
+            self.assertEqual(client.insert_embeddings([[1., 2., 3., 4.]], [7]), (1, None))
+            client.optimize(1)
+            with self.assertRaises(BridgeError):
+                client._request("search", vector=[1., 2., 3., 4.], k=1,
+                                filter={"type": "str_equal", "value": "A"})
 
     def test_spawn_handoff_concurrent_search_and_restart(self):
         self.assertIs(DB.KTANN.init_cls, KTANN)
@@ -320,7 +390,12 @@ class BridgeTests(unittest.TestCase):
             incomplete.connect(self.socket)
             incomplete.sendall(struct.pack("!I", 100))  # body deliberately never arrives
             self.stop()
-            self.assertEqual(incomplete.recv(1), b"")
+            # Closing before the frame header is consumed resets the Unix socket;
+            # closing after it is consumed returns EOF. Both terminate the request.
+            try:
+                self.assertEqual(incomplete.recv(1), b"")
+            except ConnectionResetError:
+                pass
         self.start()
         self.client()
         self.process.kill()
